@@ -1,0 +1,39 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Backend and packaged output
+go-backend/.cache/
+go-backend/web/assets/
+go-backend/web/icon.svg
+go-backend/web/manifest.webmanifest
+go-backend/web/sw.js
+dist/
+
+# Portable build toolchain
+.tools/
+
+# LocalDrop runtime data
+.localdrop/
+data/
+temp/
+logs/
+.native-*/
+*.mv.db
+*.trace.db
+*.log
+
+# Local environment and IDEs
+.env
+.env.*
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Caches antigos de build (agora ficam fora do OneDrive)
+go-backend/.cache-go/
+.cache-go/
+go-backend/*.exe
