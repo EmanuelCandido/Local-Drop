@@ -1,12 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +9,6 @@ import (
 
 type nativeSession struct {
 	DeviceID string
-	Token    string
 	Name     string
 }
 
@@ -28,28 +21,15 @@ type nativeSnapshot struct {
 	Settings  settingsResponse
 }
 
-type nativeAPIError struct {
-	Status  int
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *nativeAPIError) Error() string {
-	if e.Message != "" {
-		return e.Message
-	}
-	return fmt.Sprintf("o servidor respondeu %d", e.Status)
-}
-
+// nativeClient é a ponte entre a janela e o servidor. Tudo roda no mesmo
+// processo, então as ações chamam o servidor direto, sem passar pela rede.
 type nativeClient struct {
 	server  *Server
-	baseURL string
 	session nativeSession
-	http    *http.Client
 }
 
 func newNativeHostClient(server *Server) (*nativeClient, error) {
-	token, tokenHash, err := randomToken(32)
+	_, tokenHash, err := randomToken(32)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +54,8 @@ func newNativeHostClient(server *Server) (*nativeClient, error) {
 		}
 		server.state.Devices[id] = host
 	}
+	// O token do host é renovado a cada abertura: a janela não usa HTTP, então
+	// nenhum token válido do computador fica exposto.
 	host.TokenHash = tokenHash
 	host.Revoked = false
 	host.LastSeenAt = now
@@ -87,14 +69,9 @@ func newNativeHostClient(server *Server) (*nativeClient, error) {
 		server.mu.Unlock()
 		return nil, err
 	}
-	session := nativeSession{DeviceID: host.DeviceID, Token: token, Name: host.DisplayName}
+	session := nativeSession{DeviceID: host.DeviceID, Name: host.DisplayName}
 	server.mu.Unlock()
-	return &nativeClient{
-		server:  server,
-		baseURL: fmt.Sprintf("http://127.0.0.1:%d", server.cfg.Port),
-		session: session,
-		http:    &http.Client{Timeout: 45 * time.Second},
-	}, nil
+	return &nativeClient{server: server, session: session}, nil
 }
 
 // defaultHostName usa o nome do computador, mais fácil de reconhecer no celular.
@@ -108,39 +85,8 @@ func defaultHostName() string {
 	return "Meu PC"
 }
 
-func (c *nativeClient) request(method, path string, input, output any) error {
-	var body io.Reader
-	if input != nil {
-		encoded, err := json.Marshal(input)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(encoded)
-	}
-	request, err := http.NewRequest(method, c.baseURL+path, body)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Device "+c.session.Token)
-	request.Header.Set("X-Device-Id", c.session.DeviceID)
-	if input != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-	response, err := c.http.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		problem := &nativeAPIError{Status: response.StatusCode}
-		_ = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(problem)
-		return problem
-	}
-	if output == nil || response.StatusCode == http.StatusNoContent {
-		_, _ = io.Copy(io.Discard, response.Body)
-		return nil
-	}
-	return json.NewDecoder(response.Body).Decode(output)
+func (c *nativeClient) principal() Principal {
+	return Principal{DeviceID: c.session.DeviceID, Host: true}
 }
 
 func (c *nativeClient) snapshot() nativeSnapshot {
@@ -169,16 +115,15 @@ func (c *nativeClient) action(transferID, action string) error {
 }
 
 func (c *nativeClient) approvePairing(pairing pairingView) error {
-	return c.request(http.MethodPost, "/api/v1/pairing/requests/"+url.PathEscape(pairing.RequestID)+"/approve", map[string]string{"code": pairing.Code}, nil)
+	return c.server.approvePairing(pairing.RequestID, pairing.Code)
 }
 
 func (c *nativeClient) rejectPairing(requestID string) error {
-	return c.request(http.MethodPost, "/api/v1/pairing/requests/"+url.PathEscape(requestID)+"/reject", nil, nil)
+	return c.server.rejectPairing(requestID)
 }
 
-func (c *nativeClient) updateSettings(input map[string]any) (settingsResponse, error) {
-	var settings settingsResponse
-	err := c.request(http.MethodPatch, "/api/v1/settings", input, &settings)
+func (c *nativeClient) updateSettings(input settingsUpdate) (settingsResponse, error) {
+	settings, err := c.server.updateSettings(c.principal(), input)
 	if err == nil {
 		c.session.Name = settings.Device.DisplayName
 	}
@@ -186,7 +131,11 @@ func (c *nativeClient) updateSettings(input map[string]any) (settingsResponse, e
 }
 
 func (c *nativeClient) revoke(deviceID string) error {
-	return c.request(http.MethodDelete, "/api/v1/trusted-devices/"+url.PathEscape(deviceID), nil, nil)
+	return c.server.revokeDevice(deviceID)
+}
+
+func (c *nativeClient) clearFinished() int {
+	return c.server.clearFinished(c.session.DeviceID)
 }
 
 // offer oferece arquivos locais sem copiá-los: o destinatário baixa do original.
@@ -194,7 +143,7 @@ func (c *nativeClient) offer(receiverID string, paths []string) (TransferView, e
 	return c.server.offerLocalFiles(c.session.DeviceID, receiverID, paths)
 }
 
-// sendText transforma um texto copiado em um arquivo pequeno e o oferece.
+// sendText transforma um texto em um arquivo pequeno e o oferece.
 func (c *nativeClient) sendText(receiverID, text string) (TransferView, error) {
 	id, err := randomID()
 	if err != nil {

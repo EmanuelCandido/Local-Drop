@@ -345,7 +345,7 @@ func TestTransferToWebReceiverDownloadAndMissingRanges(t *testing.T) {
 	}
 }
 
-func TestWebSocketAuthenticationHeartbeatAndQR(t *testing.T) {
+func TestWebSocketAuthenticationAndHeartbeat(t *testing.T) {
 	cfg := testConfig(t)
 	server, err := NewServer(cfg)
 	if err != nil {
@@ -394,16 +394,6 @@ func TestWebSocketAuthenticationHeartbeatAndQR(t *testing.T) {
 	}
 	if !seenHeartbeat {
 		t.Fatal("WebSocket não respondeu ao heartbeat")
-	}
-
-	response, err := httpServer.Client().Get(httpServer.URL + "/api/v1/network/qr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	bytes, _ := io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "image/png" || len(bytes) < 100 {
-		t.Fatalf("QR inválido: status=%d tipo=%q tamanho=%d", response.StatusCode, response.Header.Get("Content-Type"), len(bytes))
 	}
 }
 
@@ -460,52 +450,4 @@ func TestLargeTransferStreaming(t *testing.T) {
 	elapsed := time.Since(started)
 	throughput := float64(len(data)) / elapsed.Seconds() / (1024 * 1024)
 	t.Logf("32 MiB transferidos e verificados em %s (%.1f MiB/s)", elapsed.Round(time.Millisecond), throughput)
-}
-
-func TestLegacyImportPreservesTokensSettingsAndHistory(t *testing.T) {
-	cfg := testConfig(t)
-	server, err := NewServer(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := t.TempDir()
-	files := map[string]string{
-		"trusted-devices.csv": "DEVICE_ID,DISPLAY_NAME,DEVICE_TYPE,TOKEN_HASH,HOST,REVOKED,CREATED_AT,LAST_SEEN_AT\n" +
-			"legacy-host,PC antigo,DESKTOP," + strings.Repeat("a", 64) + ",TRUE,FALSE,2026-08-26 18:00:00+00,2026-08-26 18:10:00+00\n",
-		"host-settings.csv": "DOWNLOAD_DIRECTORY,AUTO_ACCEPT_TRUSTED,UPDATED_AT\n" +
-			filepath.Join(legacy, "recebidos") + ",TRUE,2026-08-26 18:20:00+00\n",
-		"transfers.csv": "ID,ACCEPTED_AT,COMPLETED_AT,CREATED_AT,FAILURE_CODE,FAILURE_MESSAGE,RECEIVED_BYTES,RECEIVER_ID,RECEIVER_NAME,SENDER_ID,SENDER_NAME,STATE,TOTAL_BYTES,UPDATED_AT\n" +
-			"transfer-1,2026-08-26 18:01:00+00,2026-08-26 18:02:00+00,2026-08-26 18:00:00+00,,,4,legacy-host,PC antigo,peer-1,Celular,COMPLETED,4,2026-08-26 18:02:00+00\n",
-		"transfer-files.csv": "ID,COMPLETED_PATH,DELIVERED_NAME,MIME_TYPE,NAME,ORDINAL,RECEIVED_BYTES,RECEIVED_CHUNKS,SHA256,SIZE,STATE,TOTAL_CHUNKS,TRANSFER_ID\n" +
-			"file-1,,foto.bin,application/octet-stream,foto.bin,0,4,1," + strings.Repeat("b", 64) + ",4,COMPLETED,1,transfer-1\n",
-	}
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(legacy, name), []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := server.ImportLegacy(legacy); err != nil {
-		t.Fatal(err)
-	}
-	server.mu.RLock()
-	device := server.state.Devices["legacy-host"]
-	transfer := server.state.Transfers["transfer-1"]
-	settings := server.state.Settings
-	server.mu.RUnlock()
-	if device == nil || !device.Host || device.TokenHash != strings.Repeat("a", 64) {
-		t.Fatalf("dispositivo não foi importado: %#v", device)
-	}
-	if transfer == nil || transfer.State != "COMPLETED" || len(transfer.Files) != 1 {
-		t.Fatalf("histórico não foi importado: %#v", transfer)
-	}
-	if !settings.AutoAcceptTrusted || settings.DownloadDirectory != filepath.Join(legacy, "recebidos") {
-		t.Fatalf("configurações não foram importadas: %#v", settings)
-	}
-	reloaded, err := NewServer(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reloaded.state.Devices["legacy-host"] == nil || reloaded.state.Transfers["transfer-1"] == nil {
-		t.Fatal("importação não persistiu após recarregar")
-	}
 }

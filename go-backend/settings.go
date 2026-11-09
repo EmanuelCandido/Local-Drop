@@ -16,6 +16,13 @@ type settingsResponse struct {
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }
 
+type settingsUpdate struct {
+	DisplayName       *string `json:"displayName"`
+	DeviceType        *string `json:"deviceType"`
+	DownloadDirectory *string `json:"downloadDirectory"`
+	AutoAcceptTrusted *bool   `json:"autoAcceptTrusted"`
+}
+
 func (s *Server) settingsResponseLocked(device *DeviceRecord) settingsResponse {
 	response := settingsResponse{
 		Device:    s.deviceViewLocked(device),
@@ -40,61 +47,63 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		DisplayName       *string `json:"displayName"`
-		DeviceType        *string `json:"deviceType"`
-		DownloadDirectory *string `json:"downloadDirectory"`
-		AutoAcceptTrusted *bool   `json:"autoAcceptTrusted"`
-	}
+	var input settingsUpdate
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeProblem(w, r, err)
 		return
 	}
-	principal := principalOf(r)
-	if (input.DownloadDirectory != nil || input.AutoAcceptTrusted != nil) && !principal.Host {
-		writeProblem(w, r, problem(403, "HOST_SETTINGS_REQUIRED", "Somente o computador host pode alterar essas configurações."))
+	response, err := s.updateSettings(principalOf(r), input)
+	if err != nil {
+		writeProblem(w, r, err)
 		return
+	}
+	writeJSON(w, response)
+}
+
+// updateSettings é usado pela API do celular e, direto na memória, pela janela.
+func (s *Server) updateSettings(principal Principal, input settingsUpdate) (settingsResponse, error) {
+	if (input.DownloadDirectory != nil || input.AutoAcceptTrusted != nil) && !principal.Host {
+		return settingsResponse{}, problem(403, "HOST_SETTINGS_REQUIRED", "Só o computador pode mudar esse ajuste.")
 	}
 	var normalizedDirectory *string
 	if input.DownloadDirectory != nil {
 		trimmed := strings.TrimSpace(*input.DownloadDirectory)
 		if trimmed == "" || len(trimmed) > 2048 || !filepath.IsAbs(trimmed) {
-			writeProblem(w, r, problem(422, "DOWNLOAD_DIRECTORY_INVALID", "Escolha uma pasta absoluta válida."))
-			return
+			return settingsResponse{}, problem(422, "DOWNLOAD_DIRECTORY_INVALID", "Escolha uma pasta do computador.")
 		}
 		clean := filepath.Clean(trimmed)
 		if err := os.MkdirAll(clean, 0o755); err != nil || !directoryWritable(clean) {
-			writeProblem(w, r, problem(422, "DOWNLOAD_DIRECTORY_NOT_WRITABLE", "A pasta escolhida não permite gravação."))
-			return
+			return settingsResponse{}, problem(422, "DOWNLOAD_DIRECTORY_NOT_WRITABLE", "O Windows não deixa salvar nessa pasta. Escolha outra.")
 		}
 		normalizedDirectory = &clean
 	}
 
 	s.mu.Lock()
 	device := s.state.Devices[principal.DeviceID]
+	if device == nil {
+		s.mu.Unlock()
+		return settingsResponse{}, problem(404, "DEVICE_NOT_FOUND", "Este aparelho não está mais conectado ao computador.")
+	}
 	if input.DisplayName != nil {
 		name := strings.TrimSpace(*input.DisplayName)
 		if name == "" || len([]rune(name)) > 100 {
 			s.mu.Unlock()
-			writeProblem(w, r, problem(422, "DEVICE_NAME_INVALID", "O nome do dispositivo é inválido."))
-			return
+			return settingsResponse{}, problem(422, "DEVICE_NAME_INVALID", "Esse nome não pode ser usado. Use de 1 a 60 letras ou números.")
 		}
-		device.DisplayName = name
+		device.DisplayName = s.uniqueDeviceNameLocked(name, device.DeviceID)
 	}
 	if input.DeviceType != nil {
 		kind := strings.TrimSpace(*input.DeviceType)
 		if kind == "" || len(kind) > 32 {
 			s.mu.Unlock()
-			writeProblem(w, r, problem(422, "DEVICE_TYPE_INVALID", "O tipo do dispositivo é inválido."))
-			return
+			return settingsResponse{}, problem(422, "DEVICE_TYPE_INVALID", "O tipo do aparelho é inválido.")
 		}
 		device.DeviceType = kind
 	}
 	if normalizedDirectory != nil && *normalizedDirectory != s.state.Settings.DownloadDirectory {
 		if s.hasActiveReceiverLocked(principal.DeviceID) {
 			s.mu.Unlock()
-			writeProblem(w, r, problem(409, "DOWNLOAD_DIRECTORY_IN_USE", "A pasta não pode mudar durante um recebimento ativo."))
-			return
+			return settingsResponse{}, problem(409, "DOWNLOAD_DIRECTORY_IN_USE", "A pasta não pode mudar durante um recebimento. Espere terminar.")
 		}
 		s.state.Settings.DownloadDirectory = *normalizedDirectory
 		s.state.Settings.UpdatedAt = time.Now().UTC()
@@ -109,13 +118,12 @@ func (s *Server) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 	saveErr := s.saveLocked()
 	s.mu.Unlock()
 	if saveErr != nil {
-		writeProblem(w, r, saveErr)
-		return
+		return settingsResponse{}, saveErr
 	}
 	if input.DisplayName != nil || input.DeviceType != nil {
 		s.hub.Broadcast("DEVICE_UPDATED", map[string]any{"device": deviceView})
 	}
-	writeJSON(w, response)
+	return response, nil
 }
 
 func (s *Server) hasActiveReceiverLocked(deviceID string) bool {
@@ -131,18 +139,40 @@ func (s *Server) hasActiveReceiverLocked(deviceID string) bool {
 	return false
 }
 
-func (s *Server) handleDirectoryPick(w http.ResponseWriter, r *http.Request) {
+// savedPort devolve a porta usada da última vez, para o endereço não mudar.
+func (s *Server) savedPort() int {
 	s.mu.RLock()
-	current := s.state.Settings.DownloadDirectory
-	s.mu.RUnlock()
-	selected, ok, err := pickDirectory(current)
-	if err != nil {
-		writeProblem(w, r, problem(422, "DOWNLOAD_DIRECTORY_PICKER_UNAVAILABLE", "Não foi possível abrir o seletor de pasta."))
-		return
+	defer s.mu.RUnlock()
+	return s.state.Settings.Port
+}
+
+// usePort registra a porta em que o servidor de fato abriu.
+func (s *Server) usePort(port int) {
+	s.cfg.Port = port
+	s.mu.Lock()
+	if s.state.Settings.Port != port {
+		s.state.Settings.Port = port
+		_ = s.saveLocked()
 	}
-	if !ok {
-		writeJSON(w, map[string]any{"downloadDirectory": nil})
-		return
+	s.mu.Unlock()
+	s.urlMu.Lock()
+	s.urlCache = ""
+	s.urlMu.Unlock()
+}
+
+// autostartAsked e markAutostartAsked controlam a pergunta "abrir com o
+// Windows", feita uma única vez.
+func (s *Server) autostartAsked() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Settings.AutostartAsked
+}
+
+func (s *Server) markAutostartAsked() {
+	s.mu.Lock()
+	if !s.state.Settings.AutostartAsked {
+		s.state.Settings.AutostartAsked = true
+		_ = s.saveLocked()
 	}
-	writeJSON(w, map[string]any{"downloadDirectory": selected})
+	s.mu.Unlock()
 }

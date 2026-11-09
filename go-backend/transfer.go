@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +19,19 @@ import (
 	"unicode/utf8"
 )
 
-var sha256Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{64}$`)
+// isSHA256Hex confere se o texto é um SHA-256 em hexadecimal (64 dígitos).
+func isSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		c := value[index]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
 
 // Transferências criadas antes de o tamanho do bloco ser persistido usavam 4 MiB.
 const legacyChunkSize int64 = 4 * 1024 * 1024
@@ -56,14 +67,14 @@ type createTransferRequest struct {
 
 func validateFilename(raw string) (string, error) {
 	if raw == "" || strings.TrimSpace(raw) != raw || raw == "." || raw == ".." || utf8.RuneCountInString(raw) > 255 {
-		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome do arquivo não é seguro para o computador.")
+		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome de um arquivo tem caracteres que o Windows não aceita. Renomeie o arquivo e tente de novo.")
 	}
 	if strings.HasSuffix(raw, ".") || strings.HasSuffix(raw, " ") {
-		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome do arquivo não é seguro para o computador.")
+		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome de um arquivo tem caracteres que o Windows não aceita. Renomeie o arquivo e tente de novo.")
 	}
 	for _, character := range raw {
 		if unicode.IsControl(character) || strings.ContainsRune(`<>:"/\|?*`, character) {
-			return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome do arquivo não é seguro para o computador.")
+			return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome de um arquivo tem caracteres que o Windows não aceita. Renomeie o arquivo e tente de novo.")
 		}
 	}
 	base := raw
@@ -71,7 +82,7 @@ func validateFilename(raw string) (string, error) {
 		base = base[:dot]
 	}
 	if windowsReservedNames[strings.ToUpper(base)] {
-		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome do arquivo não é seguro para o computador.")
+		return "", problem(422, "TRANSFER_FILENAME_INVALID", "O nome de um arquivo tem caracteres que o Windows não aceita. Renomeie o arquivo e tente de novo.")
 	}
 	return raw, nil
 }
@@ -112,7 +123,7 @@ func mimeTypeFor(name string) string {
 func (s *Server) handleTransferCreate(w http.ResponseWriter, r *http.Request) {
 	principal := principalOf(r)
 	if !s.enforceAttempt(principal.DeviceID, s.cfg.CreateRateLimit, s.cfg.CreateRateWindow, s.createAttempts) {
-		writeProblem(w, r, problem(429, "TRANSFER_RATE_LIMITED", "Muitas transferências foram criadas. Tente novamente em instantes."))
+		writeProblem(w, r, problem(429, "TRANSFER_RATE_LIMITED", "Muitos envios de uma vez. Espere alguns segundos e tente de novo."))
 		return
 	}
 	var input createTransferRequest
@@ -121,7 +132,7 @@ func (s *Server) handleTransferCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(input.Files) < 1 || len(input.Files) > 1000 {
-		writeProblem(w, r, problem(422, "TRANSFER_FILES_REQUIRED", "Selecione entre 1 e 1000 arquivos."))
+		writeProblem(w, r, problem(422, "TRANSFER_FILES_REQUIRED", "Escolha entre 1 e 1000 arquivos por vez."))
 		return
 	}
 	files := make([]*TransferFile, 0, len(input.Files))
@@ -134,7 +145,7 @@ func (s *Server) handleTransferCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		// O SHA-256 completo é opcional: cada bloco já chega com o próprio hash e é
 		// gravado na posição exata, então o remetente não precisa ler o arquivo duas vezes.
-		if requested.Size < 0 || strings.TrimSpace(requested.MimeType) == "" || len(requested.MimeType) > 255 || (requested.SHA256 != "" && !sha256Pattern.MatchString(requested.SHA256)) {
+		if requested.Size < 0 || strings.TrimSpace(requested.MimeType) == "" || len(requested.MimeType) > 255 || (requested.SHA256 != "" && !isSHA256Hex(requested.SHA256)) {
 			writeProblem(w, r, problem(422, "TRANSFER_FILE_INVALID", "Os metadados de um arquivo são inválidos."))
 			return
 		}
@@ -171,7 +182,7 @@ func (s *Server) handleTransferCreate(w http.ResponseWriter, r *http.Request) {
 // (sempre o host) aceita automaticamente.
 func (s *Server) createTransfer(senderID, receiverID string, files []*TransferFile) (TransferView, bool, error) {
 	if receiverID == "" {
-		return TransferView{}, false, problem(422, "TRANSFER_RECEIVER_REQUIRED", "Escolha um dispositivo de destino.")
+		return TransferView{}, false, problem(422, "TRANSFER_RECEIVER_REQUIRED", "Escolha para qual aparelho enviar.")
 	}
 	if receiverID == senderID {
 		return TransferView{}, false, problem(422, "TRANSFER_SAME_DEVICE", "Remetente e destinatário devem ser diferentes.")
@@ -198,11 +209,11 @@ func (s *Server) createTransfer(senderID, receiverID string, files []*TransferFi
 	receiver := s.state.Devices[receiverID]
 	if sender == nil || sender.Revoked {
 		s.mu.Unlock()
-		return TransferView{}, false, problem(403, "TRANSFER_SENDER_NOT_TRUSTED", "O remetente não é confiável.")
+		return TransferView{}, false, problem(403, "TRANSFER_SENDER_NOT_TRUSTED", "Este aparelho não está mais conectado ao computador. Escaneie o QR Code de novo.")
 	}
 	if receiver == nil || receiver.Revoked {
 		s.mu.Unlock()
-		return TransferView{}, false, problem(422, "TRANSFER_RECEIVER_NOT_TRUSTED", "O destinatário não é confiável.")
+		return TransferView{}, false, problem(422, "TRANSFER_RECEIVER_NOT_TRUSTED", "Esse aparelho não está mais conectado. Conecte de novo pelo QR Code.")
 	}
 	transfer := &TransferRecord{
 		ID: transferID, SenderID: sender.DeviceID, SenderName: sender.DisplayName,
@@ -227,7 +238,7 @@ func (s *Server) createTransfer(senderID, receiverID string, files []*TransferFi
 // direto do arquivo original.
 func (s *Server) offerLocalFiles(senderID, receiverID string, paths []string) (TransferView, error) {
 	if len(paths) < 1 || len(paths) > 1000 {
-		return TransferView{}, problem(422, "TRANSFER_FILES_REQUIRED", "Selecione entre 1 e 1000 arquivos.")
+		return TransferView{}, problem(422, "TRANSFER_FILES_REQUIRED", "Escolha entre 1 e 1000 arquivos por vez.")
 	}
 	files := make([]*TransferFile, 0, len(paths))
 	for ordinal, raw := range paths {
@@ -296,7 +307,7 @@ func (s *Server) transferViewLocked(transfer *TransferRecord) TransferView {
 func (s *Server) transferListLocked(deviceID string, limit int) []TransferView {
 	transfers := make([]*TransferRecord, 0)
 	for _, transfer := range s.state.Transfers {
-		if transfer.SenderID == deviceID || transfer.ReceiverID == deviceID {
+		if (transfer.SenderID == deviceID || transfer.ReceiverID == deviceID) && !hiddenFor(transfer, deviceID) {
 			transfers = append(transfers, transfer)
 		}
 	}
@@ -324,7 +335,7 @@ func (s *Server) handleTransferView(w http.ResponseWriter, r *http.Request) {
 	transfer := s.state.Transfers[r.PathValue("transferId")]
 	if transfer == nil {
 		s.mu.RUnlock()
-		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada."))
+		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho."))
 		return
 	}
 	if transfer.SenderID != deviceID && transfer.ReceiverID != deviceID {
@@ -359,7 +370,7 @@ func (s *Server) transferAction(actorID, transferID, action string) (TransferVie
 	transfer := s.state.Transfers[transferID]
 	if transfer == nil {
 		s.mu.Unlock()
-		return TransferView{}, problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada.")
+		return TransferView{}, problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho.")
 	}
 	participant := transfer.SenderID == actorID || transfer.ReceiverID == actorID
 	if !participant {
@@ -377,7 +388,7 @@ func (s *Server) transferAction(actorID, transferID, action string) (TransferVie
 		}
 		if transfer.State != "WAITING_ACCEPTANCE" {
 			s.mu.Unlock()
-			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "A transferência não aguarda aceite.")
+			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Esse envio já foi respondido.")
 		}
 		transfer.AcceptedAt = &now
 		if isLocalSource(transfer) {
@@ -404,14 +415,14 @@ func (s *Server) transferAction(actorID, transferID, action string) (TransferVie
 		}
 		if transfer.State != "WAITING_ACCEPTANCE" {
 			s.mu.Unlock()
-			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "A transferência não pode ser recusada neste estado.")
+			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Esse envio já foi respondido.")
 		}
 		transfer.State = "REJECTED"
 		event, discard = "TRANSFER_REJECTED", partPathsLocked(transfer)
 	case "cancel":
 		if isTerminalState(transfer.State) {
 			s.mu.Unlock()
-			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "A transferência já foi finalizada.")
+			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Esse envio já terminou.")
 		}
 		transfer.State = "CANCELLED"
 		event, discard = "TRANSFER_CANCELLED", partPathsLocked(transfer)
@@ -423,7 +434,7 @@ func (s *Server) transferAction(actorID, transferID, action string) (TransferVie
 		}
 		if transfer.State != "ACCEPTED" && transfer.State != "TRANSFERRING" {
 			s.mu.Unlock()
-			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "A transferência não pode ser pausada neste estado.")
+			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Esse envio não pode ser pausado agora.")
 		}
 		transfer.State = "PAUSED"
 		event = "TRANSFER_PAUSED"
@@ -434,7 +445,7 @@ func (s *Server) transferAction(actorID, transferID, action string) (TransferVie
 		}
 		if transfer.State != "PAUSED" {
 			s.mu.Unlock()
-			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Somente uma transferência pausada pode ser retomada.")
+			return TransferView{}, problem(409, "TRANSFER_INVALID_STATE", "Esse envio não está pausado.")
 		}
 		if allFilesReceived(transfer) {
 			markVerifying(transfer)
@@ -535,7 +546,7 @@ func (s *Server) handleMissingChunks(w http.ResponseWriter, r *http.Request) {
 	transfer := s.state.Transfers[r.PathValue("transferId")]
 	if transfer == nil {
 		s.mu.RUnlock()
-		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada."))
+		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho."))
 		return
 	}
 	if transfer.SenderID != actorID {
@@ -651,7 +662,7 @@ func (s *Server) ensurePartPath(transferID, fileID string) (string, error) {
 	transfer := s.state.Transfers[transferID]
 	if transfer == nil {
 		s.mu.Unlock()
-		return "", problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada.")
+		return "", problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho.")
 	}
 	file := findTransferFile(transfer, fileID)
 	if file == nil {
@@ -692,7 +703,7 @@ func (s *Server) handleChunkUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Chunk-SHA256")))
-	if !sha256Pattern.MatchString(declaredHash) {
+	if !isSHA256Hex(declaredHash) {
 		writeProblem(w, r, problem(422, "CHUNK_HASH_INVALID", "O SHA-256 do bloco é inválido."))
 		return
 	}
@@ -703,7 +714,7 @@ func (s *Server) handleChunkUpload(w http.ResponseWriter, r *http.Request) {
 	transfer := s.state.Transfers[transferID]
 	if transfer == nil {
 		s.mu.RUnlock()
-		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada."))
+		writeProblem(w, r, problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho."))
 		return
 	}
 	if transfer.SenderID != actorID {
@@ -713,7 +724,7 @@ func (s *Server) handleChunkUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if transfer.State != "ACCEPTED" && transfer.State != "TRANSFERRING" {
 		s.mu.RUnlock()
-		writeProblem(w, r, problem(409, "TRANSFER_INVALID_STATE", "A transferência não está aceitando blocos."))
+		writeProblem(w, r, problem(409, "TRANSFER_INVALID_STATE", "O envio está pausado ou terminou. Toque em Continuar se ele estiver pausado."))
 		return
 	}
 	file := findTransferFile(transfer, fileID)
@@ -785,7 +796,7 @@ func (s *Server) handleChunkUpload(w http.ResponseWriter, r *http.Request) {
 	file = findTransferFile(transfer, fileID)
 	if transfer.State != "ACCEPTED" && transfer.State != "TRANSFERRING" {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "TRANSFER_INVALID_STATE", "A transferência deixou de aceitar blocos."))
+		writeProblem(w, r, problem(409, "TRANSFER_INVALID_STATE", "O envio foi pausado ou cancelado no outro aparelho."))
 		return
 	}
 	if file.Receipts[index] != nil {
@@ -940,13 +951,13 @@ func (s *Server) assembleTransfer(transferID string) {
 		if item.partPath == "" {
 			path, err := s.ensurePartPath(transferID, item.fileID)
 			if err != nil {
-				s.failTransfer(transferID, "TRANSFER_ASSEMBLY_FAILED", "Não foi possível preparar a pasta de destino.")
+				s.failTransfer(transferID, "TRANSFER_ASSEMBLY_FAILED", "Não deu para usar a pasta de recebimento. Confira a pasta em Ajustes.")
 				return
 			}
 			item.partPath = path
 		}
 		if err := verifyPartFile(item.partPath, item.size, item.sha256); err != nil {
-			s.failTransfer(transferID, "TRANSFER_HASH_MISMATCH", "O arquivo recebido falhou na verificação SHA-256.")
+			s.failTransfer(transferID, "TRANSFER_HASH_MISMATCH", "O arquivo chegou corrompido (a conferência falhou). Envie de novo.")
 			return
 		}
 	}
@@ -962,7 +973,7 @@ func (s *Server) assembleTransfer(transferID string) {
 			err = moveNoReplace(item.partPath, item.finalPath)
 		}
 		if err != nil {
-			s.failTransfer(transferID, "TRANSFER_ASSEMBLY_FAILED", "Não foi possível publicar o arquivo recebido.")
+			s.failTransfer(transferID, "TRANSFER_ASSEMBLY_FAILED", "Não deu para salvar o arquivo na pasta de recebimento. Confira o espaço livre e a pasta em Ajustes.")
 			return
 		}
 	}
@@ -1125,7 +1136,11 @@ func (s *Server) handleTicketDownload(w http.ResponseWriter, r *http.Request) {
 	ticket, ok := s.tickets[r.PathValue("ticket")]
 	s.ticketsMu.Unlock()
 	if !ok || time.Now().After(ticket.expiresAt) {
-		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "O link de download expirou. Toque em Baixar novamente."))
+		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "O link de download venceu. Toque em Baixar de novo."))
+		return
+	}
+	if ticket.fileID == allFilesTicket {
+		s.serveTransferZip(w, r, ticket.deviceID, ticket.transferID)
 		return
 	}
 	s.serveTransferFile(w, r, ticket.deviceID, ticket.transferID, ticket.fileID)
@@ -1138,7 +1153,7 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) downloadableFileLocked(actorID, transferID, fileID string) (*TransferFile, error) {
 	transfer := s.state.Transfers[transferID]
 	if transfer == nil {
-		return nil, problem(404, "TRANSFER_NOT_FOUND", "A transferência não foi encontrada.")
+		return nil, problem(404, "TRANSFER_NOT_FOUND", "Este envio não existe mais. Ele pode ter sido cancelado no outro aparelho.")
 	}
 	if transfer.ReceiverID != actorID {
 		return nil, problem(403, "TRANSFER_RECEIVER_REQUIRED", "Somente o destinatário pode baixar o arquivo.")
@@ -1148,7 +1163,7 @@ func (s *Server) downloadableFileLocked(actorID, transferID, fileID string) (*Tr
 		return nil, problem(404, "TRANSFER_FILE_NOT_FOUND", "O arquivo da transferência não foi encontrado.")
 	}
 	if file.CompletedPath == "" {
-		return nil, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "O arquivo não está mais disponível para download.")
+		return nil, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "Esse arquivo não está mais disponível. Peça para enviar de novo.")
 	}
 	return file, nil
 }
@@ -1168,17 +1183,17 @@ func (s *Server) serveTransferFile(w http.ResponseWriter, r *http.Request, actor
 	s.mu.RUnlock()
 	opened, err := os.Open(path)
 	if err != nil {
-		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "O arquivo não está mais disponível para download."))
+		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "Esse arquivo não está mais disponível. Peça para enviar de novo."))
 		return
 	}
 	defer opened.Close()
 	info, err := opened.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "O arquivo não está mais disponível para download."))
+		writeProblem(w, r, problem(404, "TRANSFER_DOWNLOAD_EXPIRED", "Esse arquivo não está mais disponível. Peça para enviar de novo."))
 		return
 	}
 	if source && info.Size() != size {
-		writeProblem(w, r, problem(409, "TRANSFER_SOURCE_CHANGED", "O arquivo foi alterado no computador depois da oferta. Envie-o novamente."))
+		writeProblem(w, r, problem(409, "TRANSFER_SOURCE_CHANGED", "O arquivo mudou no computador depois de ser oferecido. Peça para enviar de novo."))
 		return
 	}
 	if mimeType == "" {
@@ -1314,7 +1329,7 @@ func (s *Server) Cleanup() {
 				s.mu.Unlock()
 			}
 		case "expire":
-			s.failTransfer(current.id, "TRANSFER_EXPIRED", "A transferência expirou por inatividade.")
+			s.failTransfer(current.id, "TRANSFER_EXPIRED", "O envio ficou parado por muito tempo e foi encerrado. Envie de novo.")
 		case "downloads":
 			s.expireManagedDownloads(current.id)
 		}
@@ -1384,7 +1399,7 @@ func (s *Server) RecoverTransfers() {
 	}
 	s.mu.Unlock()
 	_ = os.RemoveAll(filepath.Join(s.cfg.StorageRoot, "go-transfers"))
-	s.cleanOutbox(0)
+	s.cleanOutboxUnused()
 	for _, id := range ids {
 		s.scheduleAssembly(id)
 	}

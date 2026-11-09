@@ -168,7 +168,7 @@ func (s *Server) enforceAttempt(key string, limit int, window time.Duration, att
 
 func (s *Server) handlePairingRequest(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceAttempt(remoteIP(r), s.cfg.PairingRateLimit, s.cfg.PairingRateWindow, s.pairingAttempts) {
-		writeProblem(w, r, problem(429, "PAIRING_RATE_LIMITED", "Muitas solicitações de pareamento. Tente novamente mais tarde."))
+		writeProblem(w, r, problem(429, "PAIRING_RATE_LIMITED", "Muitas tentativas de conexão. Espere um minuto e tente de novo."))
 		return
 	}
 	var input deviceRequest
@@ -209,13 +209,13 @@ func (s *Server) handlePairingRequest(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	if device := s.state.Devices[input.DeviceID]; device != nil && !device.Revoked {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "DEVICE_ALREADY_TRUSTED", "O dispositivo já é confiável."))
+		writeProblem(w, r, problem(409, "DEVICE_ALREADY_TRUSTED", "Este aparelho já está conectado. Recarregue a página."))
 		return
 	}
 	for _, existing := range s.state.Pairings {
 		if existing.DeviceID == input.DeviceID && (existing.Status == "PENDING" || existing.Status == "APPROVED") && now.Before(existing.ExpiresAt) {
 			s.mu.Unlock()
-			writeProblem(w, r, problem(409, "PAIRING_ALREADY_PENDING", "O dispositivo já possui um pareamento pendente."))
+			writeProblem(w, r, problem(409, "PAIRING_ALREADY_PENDING", "Já existe um pedido de conexão deste aparelho esperando resposta no computador."))
 			return
 		}
 	}
@@ -244,12 +244,12 @@ func (s *Server) handlePairingPoll(w http.ResponseWriter, r *http.Request) {
 	pairing := s.state.Pairings[id]
 	if pairing == nil {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(404, "PAIRING_NOT_FOUND", "A solicitação de pareamento não foi encontrada."))
+		writeProblem(w, r, problem(404, "PAIRING_NOT_FOUND", "O pedido de conexão não existe mais. Toque em Conectar de novo."))
 		return
 	}
 	if !secureHashMatch(pollToken, pairing.PollTokenHash) {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(403, "PAIRING_POLL_TOKEN_INVALID", "O segredo de consulta do pareamento é inválido."))
+		writeProblem(w, r, problem(403, "PAIRING_POLL_TOKEN_INVALID", "Este pedido de conexão não pertence a este aparelho. Toque em Conectar de novo."))
 		return
 	}
 	if (pairing.Status == "PENDING" || pairing.Status == "APPROVED") && !now.Before(pairing.ExpiresAt) {
@@ -269,7 +269,7 @@ func (s *Server) handlePairingPoll(w http.ResponseWriter, r *http.Request) {
 				device = &DeviceRecord{DeviceID: pairing.DeviceID, CreatedAt: now}
 				s.state.Devices[pairing.DeviceID] = device
 			}
-			device.DisplayName = pairing.DisplayName
+			device.DisplayName = s.uniqueDeviceNameLocked(pairing.DisplayName, pairing.DeviceID)
 			device.DeviceType = pairing.DeviceType
 			device.TokenHash = pairing.TokenHash
 			device.Host = false
@@ -340,37 +340,40 @@ func (s *Server) handlePairingApprove(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, err)
 		return
 	}
-	id := r.PathValue("requestId")
+	if err := s.approvePairing(r.PathValue("requestId"), input.Code); err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// approvePairing autoriza um pedido feito com o código de 6 dígitos.
+func (s *Server) approvePairing(id, code string) error {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	pairing := s.state.Pairings[id]
 	if pairing == nil {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(404, "PAIRING_NOT_FOUND", "A solicitação de pareamento não foi encontrada."))
-		return
+		return problem(404, "PAIRING_NOT_FOUND", "O pedido de conexão não existe mais. No celular, toque em Conectar de novo.")
 	}
 	if !now.Before(pairing.ExpiresAt) {
 		pairing.Status = "EXPIRED"
 		_ = s.saveLocked()
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "PAIRING_EXPIRED", "A solicitação de pareamento expirou."))
-		return
+		return problem(409, "PAIRING_EXPIRED", "O pedido de conexão venceu. No celular, toque em Conectar de novo.")
 	}
 	if pairing.Status != "PENDING" {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "PAIRING_NOT_PENDING", "A solicitação não está mais pendente."))
-		return
+		return problem(409, "PAIRING_NOT_PENDING", "Esse pedido já foi respondido.")
 	}
-	if !secureHashMatch(input.Code, pairing.CodeHash) {
+	if !secureHashMatch(code, pairing.CodeHash) {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(422, "PAIRING_CODE_INVALID", "O código de pareamento é inválido."))
-		return
+		return problem(422, "PAIRING_CODE_INVALID", "O código não confere. Peça para o celular tentar de novo.")
 	}
 	token, tokenHash, err := randomToken(32)
 	if err != nil {
 		s.mu.Unlock()
-		writeProblem(w, r, err)
-		return
+		return err
 	}
 	pairing.Status = "APPROVED"
 	pairing.TokenHash = tokenHash
@@ -379,26 +382,30 @@ func (s *Server) handlePairingApprove(w http.ResponseWriter, r *http.Request) {
 	saveErr := s.saveLocked()
 	s.mu.Unlock()
 	if saveErr != nil {
-		writeProblem(w, r, saveErr)
-		return
+		return saveErr
 	}
 	s.hub.SendToHost("PAIRING_ACCEPTED", map[string]any{"requestId": id})
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func (s *Server) handlePairingReject(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("requestId")
+	if err := s.rejectPairing(r.PathValue("requestId")); err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) rejectPairing(id string) error {
 	s.mu.Lock()
 	pairing := s.state.Pairings[id]
 	if pairing == nil {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(404, "PAIRING_NOT_FOUND", "A solicitação de pareamento não foi encontrada."))
-		return
+		return problem(404, "PAIRING_NOT_FOUND", "O pedido de conexão não existe mais.")
 	}
 	if pairing.Status != "PENDING" {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "PAIRING_NOT_PENDING", "A solicitação não está mais pendente."))
-		return
+		return problem(409, "PAIRING_NOT_PENDING", "Esse pedido já foi respondido.")
 	}
 	pairing.Status = "REJECTED"
 	pairing.Code = ""
@@ -406,11 +413,10 @@ func (s *Server) handlePairingReject(w http.ResponseWriter, r *http.Request) {
 	saveErr := s.saveLocked()
 	s.mu.Unlock()
 	if saveErr != nil {
-		writeProblem(w, r, saveErr)
-		return
+		return saveErr
 	}
 	s.hub.SendToHost("PAIRING_REJECTED", map[string]any{"requestId": id})
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -419,7 +425,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	device := s.state.Devices[principal.DeviceID]
 	if device == nil || device.Revoked {
 		s.mu.RUnlock()
-		writeProblem(w, r, problem(404, "DEVICE_NOT_FOUND", "O dispositivo não foi encontrado."))
+		writeProblem(w, r, problem(404, "DEVICE_NOT_FOUND", "Este aparelho não está mais conectado ao computador."))
 		return
 	}
 	view := s.deviceViewLocked(device)
@@ -439,13 +445,13 @@ func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	input.DeviceType = strings.TrimSpace(input.DeviceType)
 	if input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 || input.DeviceType == "" || len(input.DeviceType) > 32 {
-		writeProblem(w, r, problem(422, "DEVICE_PROFILE_INVALID", "Nome ou tipo do dispositivo é inválido."))
+		writeProblem(w, r, problem(422, "DEVICE_PROFILE_INVALID", "Esse nome não pode ser usado. Use de 1 a 60 letras ou números."))
 		return
 	}
 	principal := principalOf(r)
 	s.mu.Lock()
 	device := s.state.Devices[principal.DeviceID]
-	device.DisplayName = input.DisplayName
+	device.DisplayName = s.uniqueDeviceNameLocked(input.DisplayName, device.DeviceID)
 	device.DeviceType = input.DeviceType
 	device.LastSeenAt = time.Now().UTC()
 	view := s.deviceViewLocked(device)
@@ -467,26 +473,166 @@ func (s *Server) handleDevices(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("deviceId")
+	if err := s.revokeDevice(r.PathValue("deviceId")); err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeDevice(id string) error {
 	s.mu.Lock()
 	device := s.state.Devices[id]
 	if device == nil {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(404, "DEVICE_NOT_FOUND", "O dispositivo não foi encontrado."))
-		return
+		return problem(404, "DEVICE_NOT_FOUND", "Esse aparelho não está mais na lista.")
 	}
 	if device.Host {
 		s.mu.Unlock()
-		writeProblem(w, r, problem(409, "HOST_CANNOT_BE_REVOKED", "O computador host não pode ser revogado."))
-		return
+		return problem(409, "HOST_CANNOT_BE_REVOKED", "Este computador não pode ser removido.")
 	}
 	device.Revoked = true
+	saveErr := s.saveLocked()
+	s.mu.Unlock()
+	if saveErr != nil {
+		return saveErr
+	}
+	s.hub.Disconnect(id)
+	s.hub.Broadcast("DEVICE_REVOKED", map[string]string{"deviceId": id})
+	return nil
+}
+
+// uniqueDeviceNameLocked evita dois aparelhos com o mesmo nome na lista,
+// acrescentando " 2", " 3"... ao nome automático.
+func (s *Server) uniqueDeviceNameLocked(name, deviceID string) string {
+	name = strings.TrimSpace(name)
+	if runes := []rune(name); len(runes) > 60 {
+		name = strings.TrimSpace(string(runes[:60]))
+	}
+	taken := func(candidate string) bool {
+		for _, device := range s.state.Devices {
+			if device.DeviceID != deviceID && !device.Revoked && strings.EqualFold(device.DisplayName, candidate) {
+				return true
+			}
+		}
+		return false
+	}
+	if !taken(name) {
+		return name
+	}
+	for index := 2; index < 100; index++ {
+		candidate := fmt.Sprintf("%s %d", name, index)
+		if !taken(candidate) {
+			return candidate
+		}
+	}
+	return name
+}
+
+// ---------------------------------------------------------------- convite
+
+// pairingInvite é o segredo levado pelo QR Code. Vale uma única vez e por
+// tempo curto; só existe um convite ativo por vez e ele fica apenas na memória.
+type pairingInvite struct {
+	token     string
+	hash      string
+	expiresAt time.Time
+}
+
+// currentInvite devolve o convite ativo e cria outro quando falta menos de
+// 30 segundos para vencer.
+func (s *Server) currentInvite() (string, time.Time, error) {
+	s.inviteMu.Lock()
+	defer s.inviteMu.Unlock()
+	now := time.Now()
+	if s.invite != nil && now.Add(30*time.Second).Before(s.invite.expiresAt) {
+		return s.invite.token, s.invite.expiresAt, nil
+	}
+	token, hash, err := randomToken(24)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	s.invite = &pairingInvite{token: token, hash: hash, expiresAt: now.Add(s.cfg.PairingLifetime)}
+	return token, s.invite.expiresAt, nil
+}
+
+// dropInvite invalida o convite, por exemplo quando o QR deixa de aparecer.
+func (s *Server) dropInvite() {
+	s.inviteMu.Lock()
+	s.invite = nil
+	s.inviteMu.Unlock()
+}
+
+// consumeInvite confere e invalida o convite em uma única operação.
+func (s *Server) consumeInvite(raw string) bool {
+	s.inviteMu.Lock()
+	defer s.inviteMu.Unlock()
+	if s.invite == nil || raw == "" || !time.Now().Before(s.invite.expiresAt) || !secureHashMatch(raw, s.invite.hash) {
+		return false
+	}
+	s.invite = nil
+	return true
+}
+
+func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
+	if !s.enforceAttempt(remoteIP(r), s.cfg.PairingRateLimit, s.cfg.PairingRateWindow, s.pairingAttempts) {
+		writeProblem(w, r, problem(429, "PAIRING_RATE_LIMITED", "Muitas tentativas de conexão. Espere um minuto e tente de novo."))
+		return
+	}
+	var input struct {
+		DeviceID    string `json:"deviceId"`
+		DisplayName string `json:"displayName"`
+		DeviceType  string `json:"deviceType"`
+		Invite      string `json:"invite"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	request := deviceRequest{
+		DeviceID: strings.TrimSpace(input.DeviceID), DisplayName: strings.TrimSpace(input.DisplayName),
+		DeviceType: strings.TrimSpace(input.DeviceType),
+	}
+	if err := validateDeviceRequest(request); err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	s.mu.RLock()
+	existing := s.state.Devices[request.DeviceID]
+	s.mu.RUnlock()
+	if existing != nil && existing.Host {
+		writeProblem(w, r, problem(409, "DEVICE_ID_ALREADY_IN_USE", "Este aparelho não pode usar esse convite."))
+		return
+	}
+	if !s.consumeInvite(strings.TrimSpace(input.Invite)) {
+		writeProblem(w, r, problem(410, "PAIRING_INVITE_INVALID", "Este QR Code já foi usado ou venceu. No computador, clique em Conectar celular para mostrar outro."))
+		return
+	}
+	token, tokenHash, err := randomToken(32)
+	if err != nil {
+		writeProblem(w, r, err)
+		return
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	device := s.state.Devices[request.DeviceID]
+	if device == nil {
+		device = &DeviceRecord{DeviceID: request.DeviceID, CreatedAt: now}
+		s.state.Devices[request.DeviceID] = device
+	}
+	device.DisplayName = s.uniqueDeviceNameLocked(request.DisplayName, request.DeviceID)
+	device.DeviceType = request.DeviceType
+	device.TokenHash = tokenHash
+	device.Host = false
+	device.Revoked = false
+	device.LastSeenAt = now
+	name := device.DisplayName
 	saveErr := s.saveLocked()
 	s.mu.Unlock()
 	if saveErr != nil {
 		writeProblem(w, r, saveErr)
 		return
 	}
-	s.hub.Disconnect(id)
-	w.WriteHeader(http.StatusNoContent)
+	s.hub.SendToHost("DEVICE_PAIRED", map[string]any{"deviceId": request.DeviceID, "displayName": name})
+	writeJSONStatus(w, http.StatusCreated, map[string]string{"deviceId": request.DeviceID, "deviceToken": token, "displayName": name})
 }

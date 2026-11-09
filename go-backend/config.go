@@ -9,10 +9,17 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
+
+// Portas tentadas em ordem quando a preferida está ocupada por outro programa.
+const (
+	defaultPort = 8088
+	lastPort    = 8098
+)
 
 type Config struct {
 	Port              int
+	PortFixed         bool
 	StorageRoot       string
 	Downloads         string
 	AutoOpen          bool
@@ -35,7 +42,8 @@ func loadConfig() (Config, error) {
 	}
 	root := envString("LOCALDROP_STORAGE_ROOT", filepath.Join(home, ".localdrop"))
 	cfg := Config{
-		Port:              envInt("LOCALDROP_PORT", 8088),
+		Port:              envInt("LOCALDROP_PORT", defaultPort),
+		PortFixed:         strings.TrimSpace(os.Getenv("LOCALDROP_PORT")) != "",
 		StorageRoot:       root,
 		Downloads:         envString("LOCALDROP_DOWNLOADS", filepath.Join(home, "Downloads", "LocalDrop")),
 		AutoOpen:          envBool("LOCALDROP_AUTO_OPEN", true),
@@ -46,7 +54,7 @@ func loadConfig() (Config, error) {
 		PairingRateWindow: envDuration("LOCALDROP_SECURITY_PAIRING_RATE_WINDOW", time.Minute),
 		CreateRateLimit:   envInt("LOCALDROP_TRANSFER_CREATE_RATE_LIMIT", 20),
 		CreateRateWindow:  envDuration("LOCALDROP_TRANSFER_CREATE_RATE_WINDOW", time.Minute),
-		InactivityTimeout: envDuration("LOCALDROP_TRANSFER_INACTIVITY_TIMEOUT", 2*time.Minute),
+		InactivityTimeout: envDuration("LOCALDROP_TRANSFER_INACTIVITY_TIMEOUT", 10*time.Minute),
 		TemporaryLifetime: envDuration("LOCALDROP_TRANSFER_TEMPORARY_LIFETIME", 24*time.Hour),
 		MinimumFreeSpace:  uint64(envInt64("LOCALDROP_TRANSFER_MINIMUM_FREE_SPACE", 100*1024*1024)),
 	}
@@ -119,23 +127,6 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 	}
 	if parsed, err := time.ParseDuration(value); err == nil {
 		return parsed
-	}
-	// Compatibilidade com os valores ISO-8601 usados pela versão Java (PT2M, PT24H, PT10S).
-	upper := strings.ToUpper(value)
-	if strings.HasPrefix(upper, "PT") {
-		body := strings.TrimPrefix(upper, "PT")
-		var unit time.Duration
-		switch {
-		case strings.HasSuffix(body, "H"):
-			unit, body = time.Hour, strings.TrimSuffix(body, "H")
-		case strings.HasSuffix(body, "M"):
-			unit, body = time.Minute, strings.TrimSuffix(body, "M")
-		case strings.HasSuffix(body, "S"):
-			unit, body = time.Second, strings.TrimSuffix(body, "S")
-		}
-		if number, err := strconv.ParseFloat(body, 64); err == nil && unit > 0 {
-			return time.Duration(number * float64(unit))
-		}
 	}
 	return fallback
 }

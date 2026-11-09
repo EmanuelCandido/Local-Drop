@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/lxn/walk"
 )
 
 func TestCanvasLayoutAndHomeStayInsideClient(t *testing.T) {
@@ -29,7 +28,7 @@ func TestCanvasLayoutAndHomeStayInsideClient(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			client := walk.Rectangle{Width: test.width, Height: test.height}
+			client := rect{Width: test.width, Height: test.height}
 			layout := computeCanvasLayout(client)
 
 			if layout.width <= 0 || layout.left < 0 || layout.left+layout.width > client.Width {
@@ -46,7 +45,7 @@ func TestCanvasLayoutAndHomeStayInsideClient(t *testing.T) {
 			if len(home.banners) != test.banners {
 				t.Fatalf("avisos = %d, esperado %d", len(home.banners), test.banners)
 			}
-			sections := append(append([]walk.Rectangle{}, home.banners...), home.devices, home.drop)
+			sections := append(append([]rect{}, home.banners...), home.devices, home.drop)
 			previousBottom := layout.top
 			for _, section := range sections {
 				if section.Y < previousBottom || section.X != layout.left || section.Width != layout.width {
@@ -58,21 +57,6 @@ func TestCanvasLayoutAndHomeStayInsideClient(t *testing.T) {
 				t.Fatalf("atividade deve ocupar o espaço restante até o rodapé: activity=%+v layout=%+v", home.activity, layout)
 			}
 		})
-	}
-}
-
-func TestCanvasLayoutHasNoOuterGutters(t *testing.T) {
-	t.Parallel()
-
-	layout := edgeToEdgeCanvasLayout()
-	if !layout.MarginsZero {
-		t.Fatal("a margem zero precisa ser explícita para impedir o fallback de 9 px do Walk")
-	}
-	if !layout.SpacingZero {
-		t.Fatal("o espaçamento zero precisa ser explícito no container raiz")
-	}
-	if layout.Margins.Left != 0 || layout.Margins.Top != 0 || layout.Margins.Right != 0 || layout.Margins.Bottom != 0 {
-		t.Fatalf("margens externas inesperadas: %+v", layout.Margins)
 	}
 }
 

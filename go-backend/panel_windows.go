@@ -12,23 +12,20 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
-	"github.com/lxn/win"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
 const nativeWindowTitle = "LocalDrop"
 
-type nativeHit struct {
-	id string
-	r  walk.Rectangle
-}
+// releasesURL é a página de novidades. Fica vazia até o LocalDrop ser
+// publicado; o build pode definir com -ldflags "-X main.releasesURL=...".
+var releasesURL = ""
 
 // canvasLayout descreve a coluna de conteúdo abaixo do cabeçalho.
 type canvasLayout struct {
-	bounds              walk.Rectangle
+	bounds              rect
 	header              int
 	left, width         int
 	top, bottom, status int
@@ -36,7 +33,7 @@ type canvasLayout struct {
 
 // computeCanvasLayout é pura: toda a geometria parte daqui, então redimensionar,
 // maximizar ou mudar o DPI nunca reaproveita medidas antigas.
-func computeCanvasLayout(b walk.Rectangle) canvasLayout {
+func computeCanvasLayout(b rect) canvasLayout {
 	margin := 28
 	if b.Width < 900 {
 		margin = 20
@@ -56,14 +53,14 @@ func computeCanvasLayout(b walk.Rectangle) canvasLayout {
 	if bottom < top {
 		bottom = top
 	}
-	return canvasLayout{bounds: b, header: header, left: left, width: width, top: top, bottom: bottom, status: b.Height - 26}
+	return canvasLayout{bounds: b, header: header, left: left, width: width, top: top, bottom: bottom, status: b.Height - 27}
 }
 
 type homeLayout struct {
-	banners  []walk.Rectangle
-	devices  walk.Rectangle
-	drop     walk.Rectangle
-	activity walk.Rectangle
+	banners  []rect
+	devices  rect
+	drop     rect
+	activity rect
 }
 
 // computeHomeLayout empilha avisos, destinos, área de envio e atividade. A
@@ -72,53 +69,50 @@ func computeHomeLayout(l canvasLayout, banners int, onboarding bool) homeLayout 
 	var result homeLayout
 	y := l.top
 	for index := 0; index < banners; index++ {
-		result.banners = append(result.banners, walk.Rectangle{X: l.left, Y: y, Width: l.width, Height: 64})
+		result.banners = append(result.banners, rect{X: l.left, Y: y, Width: l.width, Height: 64})
 		y += 76
 	}
-	devicesHeight := 82
+	devicesHeight := 86
 	if onboarding {
 		devicesHeight = 216
 	}
-	result.devices = walk.Rectangle{X: l.left, Y: y, Width: l.width, Height: devicesHeight}
+	result.devices = rect{X: l.left, Y: y, Width: l.width, Height: devicesHeight}
 	y += devicesHeight + 16
 	dropHeight := 116
 	if l.bottom-y < dropHeight+16+180 {
 		dropHeight = 84
 	}
-	result.drop = walk.Rectangle{X: l.left, Y: y, Width: l.width, Height: dropHeight}
+	result.drop = rect{X: l.left, Y: y, Width: l.width, Height: dropHeight}
 	y += dropHeight + 16
 	height := l.bottom - y
 	if height < 0 {
 		height = 0
 	}
-	result.activity = walk.Rectangle{X: l.left, Y: y, Width: l.width, Height: height}
+	result.activity = rect{X: l.left, Y: y, Width: l.width, Height: height}
 	return result
 }
 
-func edgeToEdgeCanvasLayout() VBox {
-	return VBox{MarginsZero: true, SpacingZero: true}
-}
-
 var (
-	canvasBG    = walk.RGB(243, 245, 250)
-	ink         = walk.RGB(27, 31, 51)
-	muted       = walk.RGB(104, 112, 139)
-	sidebar     = walk.RGB(25, 28, 49)
-	sidebarSoft = walk.RGB(43, 47, 79)
-	headerMuted = walk.RGB(164, 170, 208)
-	primary     = walk.RGB(100, 86, 231)
-	primaryDark = walk.RGB(79, 66, 197)
-	primarySoft = walk.RGB(238, 235, 255)
-	panel       = walk.RGB(255, 255, 255)
-	line        = walk.RGB(228, 231, 241)
-	success     = walk.RGB(27, 148, 105)
-	successSoft = walk.RGB(225, 245, 236)
-	warning     = walk.RGB(204, 128, 26)
-	warningSoft = walk.RGB(253, 242, 224)
-	danger      = walk.RGB(213, 72, 85)
-	dangerSoft  = walk.RGB(252, 233, 235)
-	subtleBG    = walk.RGB(236, 238, 247)
-	white       = walk.RGB(255, 255, 255)
+	canvasBG    = rgb(243, 245, 250)
+	ink         = rgb(27, 31, 51)
+	muted       = rgb(78, 86, 112) // contraste de cerca de 7:1 sobre branco
+	sidebar     = rgb(25, 28, 49)
+	sidebarSoft = rgb(43, 47, 79)
+	headerMuted = rgb(186, 191, 224)
+	primary     = rgb(100, 86, 231)
+	primaryDark = rgb(79, 66, 197)
+	primarySoft = rgb(238, 235, 255)
+	panel       = rgb(255, 255, 255)
+	line        = rgb(228, 231, 241)
+	success     = rgb(22, 128, 90)
+	successSoft = rgb(225, 245, 236)
+	warning     = rgb(166, 98, 10)
+	warningSoft = rgb(253, 242, 224)
+	danger      = rgb(196, 54, 68)
+	dangerSoft  = rgb(252, 233, 235)
+	subtleBG    = rgb(236, 238, 247)
+	white       = rgb(255, 255, 255)
+	shadow      = rgb(232, 235, 245)
 )
 
 // Glifos da fonte Segoe MDL2 Assets, presente no Windows 10 e 11.
@@ -133,6 +127,15 @@ const (
 	glyphCheck    = ""
 	glyphShield   = ""
 	glyphMessage  = ""
+	glyphWarning  = ""
+	glyphPower    = ""
+)
+
+const (
+	oneLine      = dtVCenter | dtSingleLine | dtEndEllipsis
+	centeredLine = dtCenter | dtVCenter | dtSingleLine
+	rightLine    = dtRight | dtVCenter | dtSingleLine
+	wrapped      = dtWordBreak | dtEndEllipsis
 )
 
 type buttonKind int
@@ -150,19 +153,25 @@ type transferSpeed struct {
 	rate  float64
 }
 
+type pairedNotice struct {
+	deviceID, name string
+	at             time.Time
+}
+
 type nativeDesktopUI struct {
-	server   *Server
-	client   *nativeClient
-	window   *walk.MainWindow
-	canvas   *walk.CustomWidget
-	tray     *walk.NotifyIcon
-	appIcon  *walk.Icon
-	navIcons map[string]nativeNavIcon
-	qr       *walk.Bitmap
-	qrSmall  *walk.Bitmap
-	qrURL    string
-	fonts    map[int]*walk.Font
-	glyphs   map[int]*walk.Font
+	server *Server
+	client *nativeClient
+
+	main   *canvasWindow
+	target *canvasWindow // janela sendo desenhada agora (principal ou janela modal)
+	cache  *gdiCache
+	queue  uiQueue
+	tray   trayIcon
+
+	appIcon, appIconSmall uintptr
+	navIcons              map[int]map[string]nativeNavIcon
+	qr                    *qrcode.QRCode
+	qrText                string
 
 	snapshot       nativeSnapshot
 	peers          []DeviceView
@@ -174,9 +183,18 @@ type nativeDesktopUI struct {
 	activityRows   int
 	speeds         map[string]transferSpeed
 
-	hits                  []nativeHit
-	hover, pressed, modal string
-	confirmAction         func()
+	modal         string
+	confirmAction func()
+
+	addressIndex   int
+	health         networkHealth
+	healthAt       time.Time
+	healthChecking bool
+	fixing         bool
+	paired         *pairedNotice
+	autostartOn    bool
+	storageBytes   int64
+	qrPopup        *canvasWindow
 
 	refreshMu      sync.Mutex
 	refreshPending bool
@@ -188,7 +206,7 @@ type nativeDesktopUI struct {
 }
 
 func translateTransferState(s string) string {
-	m := map[string]string{"CREATED": "Criada", "WAITING_ACCEPTANCE": "Aguardando", "ACCEPTED": "Aceita", "TRANSFERRING": "Transferindo", "PAUSED": "Pausada", "VERIFYING": "Verificando", "COMPLETED": "Concluída", "REJECTED": "Recusada", "CANCELLED": "Cancelada", "FAILED": "Falhou"}
+	m := map[string]string{"CREATED": "Criado", "WAITING_ACCEPTANCE": "Aguardando", "ACCEPTED": "Começando", "TRANSFERRING": "Enviando", "PAUSED": "Pausado", "VERIFYING": "Conferindo", "COMPLETED": "Concluído", "REJECTED": "Recusado", "CANCELLED": "Cancelado", "FAILED": "Não concluído"}
 	if v := m[s]; v != "" {
 		return v
 	}
@@ -239,154 +257,109 @@ func isTextMessage(file TransferFileView) bool {
 	return strings.HasPrefix(file.MimeType, "text/plain") && file.Size <= 1<<20
 }
 
+func isMobileType(kind string) bool {
+	upper := strings.ToUpper(kind)
+	return strings.Contains(upper, "MOBILE") || strings.Contains(upper, "TABLET")
+}
+
+func availability(peer DeviceView) (string, color) {
+	if peer.Online {
+		return "Disponível", success
+	}
+	return "Fora do Wi-Fi · visto " + relativeTime(peer.LastSeenAt), muted
+}
+
 // ---------------------------------------------------------------- desenho
 
-func (ui *nativeDesktopUI) font(size int, bold bool) *walk.Font {
-	k := size
-	if bold {
-		k = -k
-	}
-	if f := ui.fonts[k]; f != nil {
-		return f
-	}
-	style := walk.FontStyle(0)
-	if bold {
-		style = walk.FontBold
-	}
-	f, e := walk.NewFont("Segoe UI", size, style)
-	if e == nil {
-		ui.fonts[k] = f
-	}
-	return f
-}
-
-func (ui *nativeDesktopUI) glyphFont(size int) *walk.Font {
-	if f := ui.glyphs[size]; f != nil {
-		return f
-	}
-	f, e := walk.NewFont("Segoe MDL2 Assets", size, 0)
-	if e == nil {
-		ui.glyphs[size] = f
-	}
-	return f
-}
-
-func fill(c *walk.Canvas, col walk.Color, r walk.Rectangle) {
-	b, e := walk.NewSolidColorBrush(col)
-	if e == nil {
-		defer b.Dispose()
-		_ = c.FillRectangle(b, r)
+// textSize aumenta a escala antiga (8–9 pt) para a leitura confortável de 10–11 pt.
+func textSize(size int) float64 {
+	switch {
+	case size <= 8:
+		return 9.5
+	case size == 9:
+		return 10.5
+	default:
+		return float64(size) + 1
 	}
 }
 
-func rounded(c *walk.Canvas, col walk.Color, r walk.Rectangle, rad int) {
-	b, e := walk.NewSolidColorBrush(col)
-	if e == nil {
-		defer b.Dispose()
-		_ = c.FillRoundedRectangle(b, r, walk.Size{Width: rad, Height: rad})
-	}
+func (ui *nativeDesktopUI) font(size int, bold bool) font {
+	return font{points: textSize(size), bold: bold}
 }
 
-func outline(c *walk.Canvas, col walk.Color, r walk.Rectangle, rad int) {
-	p, e := walk.NewCosmeticPen(walk.PenSolid, col)
-	if e == nil {
-		defer p.Dispose()
-		_ = c.DrawRoundedRectangle(p, r, walk.Size{Width: rad, Height: rad})
-	}
+func (ui *nativeDesktopUI) glyphFont(size int) font { return font{points: float64(size), glyph: true} }
+
+func fill(c *painter, col color, r rect)               { c.fill(col, r) }
+func rounded(c *painter, col color, r rect, rad int)   { c.rounded(col, r, rad) }
+func outline(c *painter, col color, r rect, rad int)   { c.outline(col, r, rad) }
+func dashedOutline(c *painter, col color, r rect, rad int) { c.dashed(col, r, rad) }
+func dot(c *painter, col color, r rect)                { c.dot(col, r) }
+
+func label(c *painter, s string, f font, col color, r rect, format uint32) {
+	c.text(s, f, col, r, format)
 }
 
-func dashedOutline(c *walk.Canvas, col walk.Color, r walk.Rectangle, rad int) {
-	p, e := walk.NewCosmeticPen(walk.PenDash, col)
-	if e == nil {
-		defer p.Dispose()
-		_ = c.DrawRoundedRectangle(p, r, walk.Size{Width: rad, Height: rad})
-	}
+func inset(r rect, l, t, rr, b int) rect {
+	return rect{X: r.X + l, Y: r.Y + t, Width: r.Width - l - rr, Height: r.Height - t - b}
 }
 
-func dot(c *walk.Canvas, col walk.Color, r walk.Rectangle) {
-	b, e := walk.NewSolidColorBrush(col)
-	if e == nil {
-		defer b.Dispose()
-		_ = c.FillEllipse(b, r)
-	}
-}
+func (ui *nativeDesktopUI) add(id string, r rect) { ui.target.add(id, r) }
 
-func label(c *walk.Canvas, s string, f *walk.Font, col walk.Color, r walk.Rectangle, format walk.DrawTextFormat) {
-	if f != nil && r.Width > 0 && r.Height > 0 {
-		_ = c.DrawText(s, f, col, r, format)
-	}
-}
-
-const (
-	oneLine      = walk.TextVCenter | walk.TextSingleLine | walk.TextEndEllipsis
-	centeredLine = walk.TextCenter | walk.TextVCenter | walk.TextSingleLine
-)
-
-func inset(r walk.Rectangle, l, t, rr, b int) walk.Rectangle {
-	return walk.Rectangle{X: r.X + l, Y: r.Y + t, Width: r.Width - l - rr, Height: r.Height - t - b}
-}
-
-func inside(r walk.Rectangle, x, y int) bool {
-	return x >= r.X && y >= r.Y && x < r.X+r.Width && y < r.Y+r.Height
-}
-
-func (ui *nativeDesktopUI) add(id string, r walk.Rectangle) {
-	ui.hits = append(ui.hits, nativeHit{id, r})
-}
-
-func (ui *nativeDesktopUI) hit(x, y int) string {
-	for i := len(ui.hits) - 1; i >= 0; i-- {
-		if inside(ui.hits[i].r, x, y) {
-			return ui.hits[i].id
-		}
-	}
-	return ""
+func (ui *nativeDesktopUI) hovered(id string) bool {
+	return ui.target.hover == id || ui.target.pressed == id
 }
 
 func (ui *nativeDesktopUI) invalidate() {
-	if ui.canvas != nil {
-		ui.canvas.Invalidate()
+	if ui.main != nil {
+		ui.main.invalidate()
 	}
 }
 
-func (ui *nativeDesktopUI) textWidth(c *walk.Canvas, s string, f *walk.Font) int {
-	if f == nil {
-		return len(s) * 7
-	}
-	// Sem TextCalcRect o walk devolve a própria largura de entrada.
-	measured, _, err := c.MeasureText(s, f, walk.Rectangle{Width: 2000, Height: 100}, walk.TextSingleLine|walk.TextCalcRect)
-	if err != nil {
-		return len(s) * 7
-	}
-	return measured.Width
-}
+func (ui *nativeDesktopUI) textWidth(c *painter, s string, f font) int { return c.measure(s, f) }
 
-func (ui *nativeDesktopUI) glyph(c *walk.Canvas, g string, size int, col walk.Color, r walk.Rectangle) {
+func (ui *nativeDesktopUI) glyph(c *painter, g string, size int, col color, r rect) {
 	label(c, g, ui.glyphFont(size), col, r, centeredLine)
 }
 
-func (ui *nativeDesktopUI) card(c *walk.Canvas, r walk.Rectangle) {
-	rounded(c, walk.RGB(232, 235, 245), walk.Rectangle{X: r.X, Y: r.Y + 2, Width: r.Width, Height: r.Height}, 16)
+func (ui *nativeDesktopUI) card(c *painter, r rect) {
+	rounded(c, shadow, rect{X: r.X, Y: r.Y + 2, Width: r.Width, Height: r.Height}, 16)
 	rounded(c, panel, r, 16)
 }
 
-// button desenha um botão com texto e glifo opcional e devolve a largura usada.
-func (ui *nativeDesktopUI) button(c *walk.Canvas, id, text, g string, r walk.Rectangle, kind buttonKind, enabled bool) {
-	bg, fg, hover := subtleBG, ink, walk.RGB(224, 227, 242)
+// navIcon desenha um dos SVGs fornecidos no tamanho exato em pixels.
+func (ui *nativeDesktopUI) navIcon(c *painter, id string, r rect) {
+	pixels := int(c.px(r.Width))
+	if ui.navIcons == nil {
+		ui.navIcons = map[int]map[string]nativeNavIcon{}
+	}
+	icons := ui.navIcons[pixels]
+	if icons == nil {
+		loaded, err := loadNativeNavIcons(pixels)
+		if err != nil {
+			return
+		}
+		ui.navIcons[pixels] = loaded
+		icons = loaded
+	}
+	c.icon(icons[id].active, r)
+}
+
+func (ui *nativeDesktopUI) button(c *painter, id, text, g string, r rect, kind buttonKind, enabled bool) {
+	bg, fg, hover := subtleBG, ink, rgb(224, 227, 242)
 	switch kind {
 	case buttonPrimary:
 		bg, fg, hover = primary, white, primaryDark
 	case buttonDanger:
-		bg, fg, hover = dangerSoft, danger, walk.RGB(248, 215, 220)
+		bg, fg, hover = dangerSoft, danger, rgb(248, 215, 220)
 	case buttonHeader:
-		bg, fg, hover = sidebarSoft, white, walk.RGB(56, 61, 99)
+		bg, fg, hover = sidebarSoft, white, rgb(56, 61, 99)
 	}
 	if !enabled {
-		bg, fg = walk.RGB(234, 236, 243), walk.RGB(160, 165, 182)
+		bg, fg = rgb(234, 236, 243), rgb(140, 146, 166)
 		if kind == buttonHeader {
 			bg, fg = sidebarSoft, headerMuted
 		}
-	} else if ui.hover == id || ui.pressed == id {
+	} else if ui.hovered(id) {
 		bg = hover
 	}
 	rounded(c, bg, r, 10)
@@ -399,8 +372,8 @@ func (ui *nativeDesktopUI) button(c *walk.Canvas, id, text, g string, r walk.Rec
 		tw := ui.textWidth(c, text, f)
 		total := 16 + 8 + tw
 		x := r.X + (r.Width-total)/2
-		label(c, g, ui.glyphFont(10), fg, walk.Rectangle{X: x, Y: r.Y, Width: 16, Height: r.Height}, centeredLine)
-		label(c, text, f, fg, walk.Rectangle{X: x + 24, Y: r.Y, Width: tw + 4, Height: r.Height}, walk.TextVCenter|walk.TextSingleLine)
+		label(c, g, ui.glyphFont(11), fg, rect{X: x, Y: r.Y, Width: 16, Height: r.Height}, centeredLine)
+		label(c, text, f, fg, rect{X: x + 24, Y: r.Y, Width: tw + 4, Height: r.Height}, dtVCenter|dtSingleLine)
 	}
 	if enabled {
 		ui.add(id, r)
@@ -408,28 +381,28 @@ func (ui *nativeDesktopUI) button(c *walk.Canvas, id, text, g string, r walk.Rec
 }
 
 // smallButton ajusta a largura ao texto e é desenhado da direita para a esquerda.
-func (ui *nativeDesktopUI) smallButton(c *walk.Canvas, id, text string, right, y int, kind buttonKind) int {
-	w := ui.textWidth(c, text, ui.font(9, true)) + 26
-	ui.button(c, id, text, "", walk.Rectangle{X: right - w, Y: y, Width: w, Height: 30}, kind, true)
+func (ui *nativeDesktopUI) smallButton(c *painter, id, text string, right, y int, kind buttonKind) int {
+	w := ui.textWidth(c, text, ui.font(9, true)) + 28
+	ui.button(c, id, text, "", rect{X: right - w, Y: y, Width: w, Height: 32}, kind, true)
 	return right - w - 8
 }
 
-func (ui *nativeDesktopUI) pill(c *walk.Canvas, text string, fg, bg walk.Color, right, y int) int {
+func (ui *nativeDesktopUI) pill(c *painter, text string, fg, bg color, right, y int) int {
 	f := ui.font(8, true)
 	w := ui.textWidth(c, text, f) + 22
-	r := walk.Rectangle{X: right - w, Y: y, Width: w, Height: 24}
-	rounded(c, bg, r, 12)
+	r := rect{X: right - w, Y: y, Width: w, Height: 26}
+	rounded(c, bg, r, 13)
 	label(c, text, f, fg, r, centeredLine)
 	return r.X
 }
 
-func (ui *nativeDesktopUI) toggle(c *walk.Canvas, id string, on bool, r walk.Rectangle) {
-	track := walk.RGB(204, 208, 222)
+func (ui *nativeDesktopUI) toggle(c *painter, id string, on bool, r rect) {
+	track := rgb(190, 195, 212)
 	if on {
 		track = primary
 	}
 	rounded(c, track, r, r.Height)
-	knob := walk.Rectangle{X: r.X + 3, Y: r.Y + 3, Width: r.Height - 6, Height: r.Height - 6}
+	knob := rect{X: r.X + 3, Y: r.Y + 3, Width: r.Height - 6, Height: r.Height - 6}
 	if on {
 		knob.X = r.X + r.Width - r.Height + 3
 	}
@@ -437,79 +410,108 @@ func (ui *nativeDesktopUI) toggle(c *walk.Canvas, id string, on bool, r walk.Rec
 	ui.add(id, r)
 }
 
-func (ui *nativeDesktopUI) paint(c *walk.Canvas, _ walk.Rectangle) error {
-	ui.paintBounds(c, ui.canvas.ClientBounds())
-	return nil
-}
-
-func (ui *nativeDesktopUI) paintBounds(c *walk.Canvas, b walk.Rectangle) {
+func (ui *nativeDesktopUI) paint(c *painter, b rect) {
+	ui.target = ui.main
 	l := computeCanvasLayout(b)
-	ui.hits = ui.hits[:0]
-	fill(c, canvasBG, b)
 	ui.paintHeader(c, l)
 	if ui.page == "settings" {
 		ui.paintSettings(c, l)
 	} else {
 		ui.paintHome(c, l)
 	}
-	label(c, ui.status, ui.font(8, false), muted, walk.Rectangle{X: l.left, Y: l.status, Width: l.width, Height: 18}, oneLine)
+	label(c, ui.status, ui.font(8, false), muted, rect{X: l.left, Y: l.status, Width: l.width, Height: 20}, oneLine)
 	if ui.modal != "" {
-		ui.hits = ui.hits[:0]
+		ui.main.hits = ui.main.hits[:0]
 		ui.paintModal(c, b)
 	}
 }
 
-func (ui *nativeDesktopUI) paintHeader(c *walk.Canvas, l canvasLayout) {
-	fill(c, sidebar, walk.Rectangle{Width: l.bounds.Width, Height: l.header})
-	logo := walk.Rectangle{X: l.left, Y: 17, Width: 38, Height: 38}
+func (ui *nativeDesktopUI) paintHeader(c *painter, l canvasLayout) {
+	fill(c, sidebar, rect{Width: l.bounds.Width, Height: l.header})
+	logo := rect{X: l.left, Y: 17, Width: 38, Height: 38}
 	rounded(c, primary, logo, 12)
-	if icon := ui.navIcons["nav-history"].active; icon != nil {
-		_ = c.DrawImageStretched(icon, inset(logo, 8, 8, 8, 8))
-	}
-	label(c, "LocalDrop", ui.font(13, true), white, walk.Rectangle{X: logo.X + 50, Y: 14, Width: 260, Height: 24}, oneLine)
+	ui.navIcon(c, "nav-history", inset(logo, 8, 8, 8, 8))
+	label(c, "LocalDrop", ui.font(13, true), white, rect{X: logo.X + 50, Y: 12, Width: 260, Height: 26}, oneLine)
 	statusColor := success
-	if len(ui.peers) == 0 {
-		statusColor = warning
+	if len(ui.peers) == 0 || ui.health.problem() {
+		statusColor = rgb(240, 170, 60)
 	}
-	dot(c, statusColor, walk.Rectangle{X: logo.X + 51, Y: 43, Width: 8, Height: 8})
-	label(c, ui.headerStatus, ui.font(8, false), headerMuted, walk.Rectangle{X: logo.X + 65, Y: 37, Width: l.width/2 - 60, Height: 20}, oneLine)
+	dot(c, statusColor, rect{X: logo.X + 51, Y: 44, Width: 8, Height: 8})
+	label(c, ui.headerStatus, ui.font(8, false), headerMuted, rect{X: logo.X + 65, Y: 37, Width: l.width/2 - 40, Height: 22}, oneLine)
 
 	right := l.left + l.width
-	gear := walk.Rectangle{X: right - 40, Y: 16, Width: 40, Height: 40}
+	gear := rect{X: right - 40, Y: 16, Width: 40, Height: 40}
 	gearID, bg := "settings", sidebarSoft
 	if ui.page == "settings" {
 		gearID, bg = "home", primary
-	} else if ui.hover == gearID {
-		bg = walk.RGB(56, 61, 99)
+	} else if ui.hovered(gearID) {
+		bg = rgb(56, 61, 99)
 	}
 	rounded(c, bg, gear, 10)
-	if icon := ui.navIcons["nav-settings"].active; icon != nil {
-		_ = c.DrawImageStretched(icon, inset(gear, 10, 10, 10, 10))
-	}
+	ui.navIcon(c, "nav-settings", inset(gear, 10, 10, 10, 10))
 	ui.add(gearID, gear)
-	ui.button(c, "connect", "Conectar celular", glyphQR, walk.Rectangle{X: gear.X - 186, Y: 16, Width: 176, Height: 40}, buttonPrimary, true)
+	ui.button(c, "connect", "Conectar celular", glyphQR, rect{X: gear.X - 196, Y: 16, Width: 186, Height: 40}, buttonPrimary, true)
 }
 
 // ---------------------------------------------------------------- início
 
-func (ui *nativeDesktopUI) paintHome(c *walk.Canvas, l canvasLayout) {
-	pairings := ui.snapshot.Pairings
-	if len(pairings) > 2 {
-		pairings = pairings[:2]
+type bannerKind int
+
+const (
+	bannerPairing bannerKind = iota
+	bannerNetwork
+	bannerPaired
+	bannerOffer
+	bannerAutostart
+)
+
+type bannerItem struct {
+	kind     bannerKind
+	pairing  pairingView
+	transfer TransferView
+}
+
+// banners escolhe no máximo dois avisos, do mais urgente ao menos urgente.
+func (ui *nativeDesktopUI) banners() []bannerItem {
+	items := make([]bannerItem, 0, 2)
+	for _, pairing := range ui.snapshot.Pairings {
+		items = append(items, bannerItem{kind: bannerPairing, pairing: pairing})
 	}
-	offers := ui.incomingOffers
-	if len(offers) > 2-len(pairings) {
-		offers = offers[:2-len(pairings)]
+	if ui.health.problem() || ui.fixing {
+		items = append(items, bannerItem{kind: bannerNetwork})
 	}
-	layout := computeHomeLayout(l, len(pairings)+len(offers), len(ui.peers) == 0)
-	index := 0
-	for _, pairing := range pairings {
-		ui.paintPairingBanner(c, layout.banners[index], pairing)
-		index++
+	if ui.paired != nil {
+		items = append(items, bannerItem{kind: bannerPaired})
 	}
-	for _, offer := range offers {
-		ui.paintOfferBanner(c, layout.banners[index], offer)
-		index++
+	for _, offer := range ui.incomingOffers {
+		items = append(items, bannerItem{kind: bannerOffer, transfer: offer})
+	}
+	if len(ui.peers) > 0 && !ui.server.autostartAsked() && !ui.autostartOn {
+		items = append(items, bannerItem{kind: bannerAutostart})
+	}
+	if len(items) > 2 {
+		items = items[:2]
+	}
+	return items
+}
+
+func (ui *nativeDesktopUI) paintHome(c *painter, l canvasLayout) {
+	items := ui.banners()
+	layout := computeHomeLayout(l, len(items), len(ui.peers) == 0)
+	for index, item := range items {
+		r := layout.banners[index]
+		switch item.kind {
+		case bannerPairing:
+			ui.paintPairingBanner(c, r, item.pairing)
+		case bannerNetwork:
+			ui.paintNetworkBanner(c, r)
+		case bannerPaired:
+			ui.paintPairedBanner(c, r)
+		case bannerOffer:
+			ui.paintOfferBanner(c, r, item.transfer)
+		case bannerAutostart:
+			ui.paintAutostartBanner(c, r)
+		}
 	}
 	if len(ui.peers) == 0 {
 		ui.paintOnboarding(c, layout.devices)
@@ -520,192 +522,316 @@ func (ui *nativeDesktopUI) paintHome(c *walk.Canvas, l canvasLayout) {
 	ui.paintActivity(c, layout.activity)
 }
 
-func (ui *nativeDesktopUI) banner(c *walk.Canvas, r walk.Rectangle, accent, soft walk.Color, g, title, detail string) {
+// bannerFrame desenha o cartão do aviso; os botões vêm depois, por cima.
+func (ui *nativeDesktopUI) bannerFrame(c *painter, r rect, accent, soft color, g string) {
 	ui.card(c, r)
-	fill(c, accent, walk.Rectangle{X: r.X, Y: r.Y + 12, Width: 4, Height: r.Height - 24})
-	circle := walk.Rectangle{X: r.X + 18, Y: r.Y + 14, Width: 36, Height: 36}
+	fill(c, accent, rect{X: r.X, Y: r.Y + 12, Width: 4, Height: r.Height - 24})
+	circle := rect{X: r.X + 18, Y: r.Y + 14, Width: 36, Height: 36}
 	dot(c, soft, circle)
 	ui.glyph(c, g, 12, accent, circle)
-	label(c, title, ui.font(10, true), ink, walk.Rectangle{X: r.X + 66, Y: r.Y + 11, Width: r.Width - 300, Height: 22}, oneLine)
-	label(c, detail, ui.font(8, false), muted, walk.Rectangle{X: r.X + 66, Y: r.Y + 33, Width: r.Width - 300, Height: 20}, oneLine)
 }
 
-func (ui *nativeDesktopUI) paintPairingBanner(c *walk.Canvas, r walk.Rectangle, p pairingView) {
-	ui.banner(c, r, warning, warningSoft, glyphShield, p.DisplayName+" quer se conectar",
-		"Confira se o celular mostra o código "+p.Code+" antes de confiar.")
+// bannerText escreve título e detalhe até onde começam os botões.
+func (ui *nativeDesktopUI) bannerText(c *painter, r rect, title, detail string, textRight int) {
+	width := textRight - (r.X + 66) - 12
+	label(c, title, ui.font(10, true), ink, rect{X: r.X + 66, Y: r.Y + 9, Width: width, Height: 24}, oneLine)
+	label(c, detail, ui.font(8, false), muted, rect{X: r.X + 66, Y: r.Y + 33, Width: width, Height: 22}, oneLine)
+}
+
+func (ui *nativeDesktopUI) paintPairingBanner(c *painter, r rect, p pairingView) {
+	ui.bannerFrame(c, r, warning, warningSoft, glyphShield)
 	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "pair-approve|"+p.RequestID, "Confiar", x, r.Y+17, buttonPrimary)
-	ui.smallButton(c, "pair-reject|"+p.RequestID, "Recusar", x, r.Y+17, buttonSubtle)
-	label(c, p.Code, ui.font(14, true), warning, walk.Rectangle{X: x - 220, Y: r.Y, Width: 110, Height: r.Height}, walk.TextRight|walk.TextVCenter|walk.TextSingleLine)
+	x = ui.smallButton(c, "pair-approve|"+p.RequestID, "Permitir", x, r.Y+16, buttonPrimary)
+	x = ui.smallButton(c, "pair-reject|"+p.RequestID, "Recusar", x, r.Y+16, buttonSubtle)
+	code := p.Code
+	if len(code) == 6 {
+		code = code[:3] + " " + code[3:]
+	}
+	label(c, code, ui.font(14, true), warning, rect{X: x - 120, Y: r.Y, Width: 112, Height: r.Height}, rightLine)
+	ui.bannerText(c, r, p.DisplayName+" quer se conectar",
+		"Permita só se o celular mostrar este mesmo código.", x-130)
 }
 
-func (ui *nativeDesktopUI) paintOfferBanner(c *walk.Canvas, r walk.Rectangle, t TransferView) {
+func (ui *nativeDesktopUI) paintNetworkBanner(c *painter, r rect) {
+	ui.bannerFrame(c, r, warning, warningSoft, glyphWarning)
+	x := r.X + r.Width - 16
+	title := "O Windows está bloqueando o celular"
+	detail := "O firewall não liberou o LocalDrop. Corrigir pede uma permissão ao Windows."
+	if ui.health.PublicNetwork {
+		detail = "Este Wi-Fi está como rede pública. Corrigir resolve com uma permissão."
+	}
+	if ui.fixing {
+		title, detail = "Aguardando a permissão do Windows…", "Confirme no aviso do Windows que apareceu na tela."
+	} else {
+		x = ui.smallButton(c, "net-fix", "Corrigir", x, r.Y+16, buttonPrimary)
+		x = ui.smallButton(c, "net-settings", "Configurações de rede", x, r.Y+16, buttonSubtle)
+	}
+	ui.bannerText(c, r, title, detail, x)
+}
+
+func (ui *nativeDesktopUI) paintPairedBanner(c *painter, r rect) {
+	ui.bannerFrame(c, r, success, successSoft, glyphCheck)
+	x := r.X + r.Width - 16
+	x = ui.smallButton(c, "paired-ok", "OK", x, r.Y+16, buttonPrimary)
+	x = ui.smallButton(c, "paired-undo", "Desfazer", x, r.Y+16, buttonSubtle)
+	ui.bannerText(c, r, ui.paired.name+" foi conectado",
+		"Já pode enviar e receber arquivos. Não foi você? Clique em Desfazer.", x)
+}
+
+func (ui *nativeDesktopUI) paintOfferBanner(c *painter, r rect, t TransferView) {
+	ui.bannerFrame(c, r, primary, primarySoft, glyphDownload)
 	files := fmt.Sprintf("%d arquivos", len(t.Files))
 	if len(t.Files) == 1 {
 		files = t.Files[0].Name
 	}
-	ui.banner(c, r, primary, primarySoft, glyphDownload, ui.peerName(t.SenderID)+" quer enviar "+files,
-		formatNativeBytes(t.TotalBytes)+" · os arquivos vão para "+ui.downloadDirectory())
 	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "t-accept|"+t.ID, "Aceitar", x, r.Y+17, buttonPrimary)
-	ui.smallButton(c, "t-reject|"+t.ID, "Recusar", x, r.Y+17, buttonSubtle)
+	x = ui.smallButton(c, "t-accept|"+t.ID, "Aceitar", x, r.Y+16, buttonPrimary)
+	x = ui.smallButton(c, "t-reject|"+t.ID, "Recusar", x, r.Y+16, buttonSubtle)
+	ui.bannerText(c, r, ui.peerName(t.SenderID)+" quer enviar "+files,
+		formatNativeBytes(t.TotalBytes)+" · vai para "+ui.downloadDirectory(), x)
 }
 
-func (ui *nativeDesktopUI) paintOnboarding(c *walk.Canvas, r walk.Rectangle) {
-	ui.card(c, r)
-	ui.ensureQR()
-	qr := walk.Rectangle{X: r.X + 20, Y: r.Y + 18, Width: 180, Height: 180}
-	if ui.qrSmall != nil {
-		_ = c.DrawImageStretched(ui.qrSmall, qr)
+func (ui *nativeDesktopUI) paintAutostartBanner(c *painter, r rect) {
+	ui.bannerFrame(c, r, primary, primarySoft, glyphPower)
+	x := r.X + r.Width - 16
+	x = ui.smallButton(c, "autostart-yes", "Sim, abrir", x, r.Y+16, buttonPrimary)
+	x = ui.smallButton(c, "autostart-no", "Agora não", x, r.Y+16, buttonSubtle)
+	ui.bannerText(c, r, "Abrir o LocalDrop junto com o Windows?",
+		"Assim ele fica pronto na bandeja para receber, sem você precisar lembrar.", x)
+}
+
+// inviteURL é o endereço levado pelo QR: abre o LocalDrop no celular já com
+// um convite de uso único.
+func (ui *nativeDesktopUI) inviteURL() (string, time.Time) {
+	token, expires, err := ui.server.currentInvite()
+	base := ui.addressURL()
+	if err != nil {
+		return base, time.Time{}
 	}
+	return base + "/#convite=" + token, expires
+}
+
+// addressURL devolve o endereço escolhido (o melhor, ou outro, se a pessoa
+// pediu para tentar outro).
+func (ui *nativeDesktopUI) addressURL() string {
+	if ui.addressIndex == 0 {
+		return ui.server.localURL()
+	}
+	addresses := ui.server.addresses()
+	if len(addresses) == 0 {
+		return ui.server.localURL()
+	}
+	return ui.server.urlForAddress(addresses[ui.addressIndex%len(addresses)].IPv4)
+}
+
+func (ui *nativeDesktopUI) ensureQR() {
+	target, _ := ui.inviteURL()
+	if ui.qr != nil && ui.qrText == target {
+		return
+	}
+	code, err := qrcode.New(target, qrcode.Medium)
+	if err != nil {
+		return
+	}
+	code.DisableBorder = true
+	ui.qr, ui.qrText = code, target
+}
+
+func (ui *nativeDesktopUI) paintQR(c *painter, r rect) {
+	ui.ensureQR()
+	rounded(c, white, r, 12)
+	c.qr(ui.qr, inset(r, 10, 10, 10, 10), ink)
+}
+
+func (ui *nativeDesktopUI) paintOnboarding(c *painter, r rect) {
+	ui.card(c, r)
+	qr := rect{X: r.X + 16, Y: r.Y + 14, Width: 188, Height: 188}
+	outline(c, line, qr, 12)
+	ui.paintQR(c, qr)
 	x := qr.X + qr.Width + 28
 	w := r.X + r.Width - x - 24
-	label(c, "Conecte seu celular", ui.font(15, true), ink, walk.Rectangle{X: x, Y: r.Y + 22, Width: w, Height: 30}, oneLine)
+	label(c, "Conecte seu celular", ui.font(15, true), ink, rect{X: x, Y: r.Y + 20, Width: w, Height: 32}, oneLine)
 	steps := []string{
-		"Aponte a câmera do celular para o código ao lado.",
-		"Abra o link e toque em Parear com este computador.",
-		"Confira o código de 6 dígitos e toque em Confiar aqui.",
+		"Abra a câmera do celular e aponte para o código ao lado.",
+		"Toque no link que aparecer na tela do celular.",
+		"Pronto: o celular já fica conectado a este computador.",
 	}
 	for i, step := range steps {
-		y := r.Y + 64 + i*30
-		circle := walk.Rectangle{X: x, Y: y, Width: 22, Height: 22}
+		y := r.Y + 62 + i*32
+		circle := rect{X: x, Y: y, Width: 24, Height: 24}
 		dot(c, primarySoft, circle)
 		label(c, fmt.Sprint(i+1), ui.font(8, true), primary, circle, centeredLine)
-		label(c, step, ui.font(9, false), ink, walk.Rectangle{X: x + 32, Y: y, Width: w - 32, Height: 22}, oneLine)
+		label(c, step, ui.font(9, false), ink, rect{X: x + 34, Y: y, Width: w - 34, Height: 24}, oneLine)
 	}
-	label(c, ui.server.localURL(), ui.font(9, true), primary, walk.Rectangle{X: x, Y: r.Y + 164, Width: w - 170, Height: 30}, oneLine)
-	ui.button(c, "copy-url", "Copiar endereço", "", walk.Rectangle{X: r.X + r.Width - 184, Y: r.Y + 162, Width: 160, Height: 34}, buttonSubtle, true)
+	buttonX := r.X + r.Width - 24
+	buttonX = ui.smallButton(c, "connect-help", "Não funcionou?", buttonX, r.Y+164, buttonSubtle)
+	label(c, "O celular precisa estar no mesmo Wi-Fi deste computador.", ui.font(8, false), muted, rect{X: x, Y: r.Y + 164, Width: buttonX - x - 8, Height: 32}, oneLine)
 }
 
-func (ui *nativeDesktopUI) paintDevices(c *walk.Canvas, r walk.Rectangle) {
-	label(c, "ENVIAR PARA", ui.font(8, true), muted, walk.Rectangle{X: r.X + 2, Y: r.Y, Width: 200, Height: 18}, oneLine)
-	chipY, chipH, gap := r.Y+24, 56, 12
+func (ui *nativeDesktopUI) paintDevices(c *painter, r rect) {
+	label(c, "ENVIAR PARA", ui.font(8, true), muted, rect{X: r.X + 2, Y: r.Y, Width: 200, Height: 20}, oneLine)
+	chipY, chipH, gap := r.Y+26, 58, 12
 	available := r.Width - chipH - gap
 	n := len(ui.peers)
-	chipW := 220
+	chipW := 230
 	if n > 0 && (available-(n-1)*gap)/n < chipW {
 		chipW = (available - (n-1)*gap) / n
 	}
-	if chipW < 160 {
-		chipW = 160
+	if chipW < 170 {
+		chipW = 170
 	}
 	x := r.X
 	for _, peer := range ui.peers {
 		if x+chipW > r.X+available {
 			break
 		}
-		chip := walk.Rectangle{X: x, Y: chipY, Width: chipW, Height: chipH}
+		chip := rect{X: x, Y: chipY, Width: chipW, Height: chipH}
+		id := "peer|" + peer.DeviceID
 		selected := peer.DeviceID == ui.selectedPeer
 		bg, border := panel, line
 		if selected {
 			bg, border = primarySoft, primary
-		} else if ui.hover == "peer|"+peer.DeviceID {
-			border = walk.RGB(200, 194, 245)
+		} else if ui.hovered(id) {
+			border = rgb(200, 194, 245)
 		}
 		rounded(c, bg, chip, 14)
 		outline(c, border, chip, 14)
 		if selected {
 			outline(c, border, inset(chip, 1, 1, 1, 1), 13)
 		}
-		circle := walk.Rectangle{X: chip.X + 10, Y: chip.Y + 10, Width: 36, Height: 36}
+		circle := rect{X: chip.X + 10, Y: chip.Y + 11, Width: 36, Height: 36}
 		circleBG, glyphColor := subtleBG, ink
 		if selected {
 			circleBG, glyphColor = primary, white
 		}
 		dot(c, circleBG, circle)
-		g := glyphPhone
-		if !strings.Contains(strings.ToUpper(peer.DeviceType), "MOBILE") && !strings.Contains(strings.ToUpper(peer.DeviceType), "TABLET") {
-			g = glyphDesktop
+		g := glyphDesktop
+		if isMobileType(peer.DeviceType) {
+			g = glyphPhone
 		}
 		ui.glyph(c, g, 12, glyphColor, circle)
-		label(c, peer.DisplayName, ui.font(9, true), ink, walk.Rectangle{X: chip.X + 56, Y: chip.Y + 9, Width: chipW - 66, Height: 20}, oneLine)
-		state, stateColor := "Offline · "+relativeTime(peer.LastSeenAt), muted
-		if peer.Online {
-			state, stateColor = "Online", success
+		label(c, peer.DisplayName, ui.font(9, true), ink, rect{X: chip.X + 56, Y: chip.Y + 8, Width: chipW - 66, Height: 22}, oneLine)
+		state, stateColor := "Disponível", success
+		if !peer.Online {
+			state, stateColor = "Fora do Wi-Fi", muted
 		}
-		dot(c, stateColor, walk.Rectangle{X: chip.X + 57, Y: chip.Y + 36, Width: 7, Height: 7})
-		label(c, state, ui.font(8, false), stateColor, walk.Rectangle{X: chip.X + 70, Y: chip.Y + 29, Width: chipW - 80, Height: 20}, oneLine)
-		ui.add("peer|"+peer.DeviceID, chip)
+		dot(c, stateColor, rect{X: chip.X + 57, Y: chip.Y + 37, Width: 7, Height: 7})
+		label(c, state, ui.font(8, false), stateColor, rect{X: chip.X + 70, Y: chip.Y + 29, Width: chipW - 80, Height: 22}, oneLine)
+		ui.add(id, chip)
 		x += chipW + gap
 	}
-	add := walk.Rectangle{X: x, Y: chipY, Width: chipH, Height: chipH}
+	add := rect{X: x, Y: chipY, Width: chipH, Height: chipH}
 	bg := panel
-	if ui.hover == "connect-chip" {
+	if ui.hovered("connect-chip") {
 		bg = primarySoft
 	}
 	rounded(c, bg, add, 14)
-	dashedOutline(c, walk.RGB(190, 184, 240), add, 14)
+	dashedOutline(c, rgb(190, 184, 240), add, 14)
 	ui.glyph(c, glyphAdd, 12, primary, add)
 	ui.add("connect-chip", add)
 }
 
-func (ui *nativeDesktopUI) paintDrop(c *walk.Canvas, r walk.Rectangle) {
+func (ui *nativeDesktopUI) paintDrop(c *painter, r rect) {
 	enabled := ui.selectedPeer != ""
-	bg, border := panel, walk.RGB(196, 190, 242)
-	if enabled && ui.hover == "drop" {
-		bg, border = walk.RGB(247, 246, 255), primary
+	bg, border := panel, rgb(196, 190, 242)
+	if enabled && ui.hovered("drop") {
+		bg, border = rgb(247, 246, 255), primary
 	}
 	rounded(c, bg, r, 16)
 	dashedOutline(c, border, r, 16)
-	circle := walk.Rectangle{X: r.X + 24, Y: r.Y + (r.Height-52)/2, Width: 52, Height: 52}
+	circle := rect{X: r.X + 24, Y: r.Y + (r.Height-52)/2, Width: 52, Height: 52}
 	if r.Height < 100 {
-		circle = walk.Rectangle{X: r.X + 20, Y: r.Y + (r.Height-44)/2, Width: 44, Height: 44}
+		circle = rect{X: r.X + 20, Y: r.Y + (r.Height-44)/2, Width: 44, Height: 44}
 	}
 	dot(c, primarySoft, circle)
 	ui.glyph(c, glyphUpload, 16, primary, circle)
 	x := circle.X + circle.Width + 18
-	w := r.X + r.Width - x - 20
 	if !enabled {
-		label(c, "Arraste arquivos para cá", ui.font(11, true), muted, walk.Rectangle{X: x, Y: r.Y + r.Height/2 - 24, Width: w, Height: 24}, oneLine)
-		label(c, "Primeiro conecte um celular — o envio fica disponível assim que ele for aprovado.", ui.font(9, false), muted, walk.Rectangle{X: x, Y: r.Y + r.Height/2, Width: w, Height: 22}, oneLine)
+		w := r.X + r.Width - x - 20
+		label(c, "Arraste arquivos para cá", ui.font(11, true), muted, rect{X: x, Y: r.Y + r.Height/2 - 26, Width: w, Height: 26}, oneLine)
+		label(c, "Primeiro conecte um celular. O envio fica disponível assim que ele aparecer aqui.", ui.font(9, false), muted, rect{X: x, Y: r.Y + r.Height/2, Width: w, Height: 24}, oneLine)
 		return
 	}
-	label(c, "Arraste arquivos para cá ou clique para escolher", ui.font(11, true), ink, walk.Rectangle{X: x, Y: r.Y + r.Height/2 - 25, Width: w, Height: 24}, oneLine)
-	label(c, "Vão para "+ui.peerName(ui.selectedPeer)+", sem cópias extras  ·  Ctrl+V envia o texto copiado", ui.font(9, false), muted, walk.Rectangle{X: x, Y: r.Y + r.Height/2 + 1, Width: w, Height: 22}, oneLine)
 	ui.add("drop", r)
+	textButton := r.X + r.Width - 20
+	textButton = ui.smallButton(c, "send-text", "Enviar texto", textButton, r.Y+(r.Height-32)/2, buttonSubtle)
+	w := textButton - x - 8
+	label(c, "Arraste arquivos para cá ou clique para escolher", ui.font(11, true), ink, rect{X: x, Y: r.Y + r.Height/2 - 27, Width: w, Height: 26}, oneLine)
+	label(c, "Vão para "+ui.peerName(ui.selectedPeer)+", sem cópias extras", ui.font(9, false), muted, rect{X: x, Y: r.Y + r.Height/2 + 1, Width: w, Height: 24}, oneLine)
 }
 
-func (ui *nativeDesktopUI) paintActivity(c *walk.Canvas, r walk.Rectangle) {
+func (ui *nativeDesktopUI) hasFinished() bool {
+	for _, t := range ui.snapshot.Transfers {
+		if isTerminalState(t.State) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ui *nativeDesktopUI) paintActivity(c *painter, r rect) {
 	ui.activityRows = 0
 	if r.Height < 96 {
 		return
 	}
 	ui.card(c, r)
-	label(c, "ATIVIDADE", ui.font(8, true), primary, walk.Rectangle{X: r.X + 20, Y: r.Y + 14, Width: 200, Height: 20}, oneLine)
+	label(c, "ATIVIDADE", ui.font(8, true), primary, rect{X: r.X + 20, Y: r.Y + 12, Width: 200, Height: 24}, oneLine)
 	transfers := ui.snapshot.Transfers
 	if len(transfers) == 0 {
-		label(c, "Nada por aqui ainda", ui.font(11, true), ink, walk.Rectangle{X: r.X + 20, Y: r.Y + 48, Width: r.Width - 40, Height: 24}, oneLine)
-		label(c, "Arquivos enviados e recebidos aparecem nesta lista, com progresso e atalhos para abrir.", ui.font(9, false), muted, walk.Rectangle{X: r.X + 20, Y: r.Y + 74, Width: r.Width - 40, Height: 22}, oneLine)
+		label(c, "Nada por aqui ainda", ui.font(11, true), ink, rect{X: r.X + 20, Y: r.Y + 46, Width: r.Width - 40, Height: 26}, oneLine)
+		label(c, "Arquivos enviados e recebidos aparecem nesta lista, com o andamento e atalhos para abrir.", ui.font(9, false), muted, rect{X: r.X + 20, Y: r.Y + 74, Width: r.Width - 40, Height: 24}, oneLine)
 		return
 	}
-	rowH := 58
-	visible := (r.Height - 52) / rowH
+	headerRight := r.X + r.Width - 16
+	if ui.hasFinished() {
+		headerRight = ui.smallButton(c, "clear-list", "Limpar lista", headerRight, r.Y+8, buttonSubtle)
+	}
+	rowH := 60
+	listTop := r.Y + 46
+	visible := (r.Y + r.Height - 8 - listTop) / rowH
 	if visible < 1 {
 		visible = 1
 	}
 	ui.activityRows = visible
 	ui.clampActivity()
-	if len(transfers) > visible {
+	scrollable := len(transfers) > visible
+	rowRight := r.X + r.Width - 12
+	if scrollable {
 		end := ui.activityOffset + visible
 		if end > len(transfers) {
 			end = len(transfers)
 		}
-		label(c, fmt.Sprintf("%d–%d de %d · role para ver mais", ui.activityOffset+1, end, len(transfers)), ui.font(8, false), muted,
-			walk.Rectangle{X: r.X + r.Width - 320, Y: r.Y + 14, Width: 300, Height: 20}, walk.TextRight|walk.TextVCenter|walk.TextSingleLine)
+		label(c, fmt.Sprintf("%d–%d de %d", ui.activityOffset+1, end, len(transfers)), ui.font(8, false), muted,
+			rect{X: headerRight - 200, Y: r.Y + 12, Width: 192, Height: 24}, rightLine)
+		// Barra de rolagem: mostra onde a lista está; clicar na trilha avança uma página.
+		track := rect{X: r.X + r.Width - 14, Y: listTop + 4, Width: 6, Height: visible*rowH - 8}
+		rounded(c, subtleBG, track, 6)
+		thumbH := track.Height * visible / len(transfers)
+		if thumbH < 24 {
+			thumbH = 24
+		}
+		thumbY := track.Y
+		if span := len(transfers) - visible; span > 0 {
+			thumbY += (track.Height - thumbH) * ui.activityOffset / span
+		}
+		rounded(c, rgb(180, 174, 236), rect{X: track.X, Y: thumbY, Width: track.Width, Height: thumbH}, 6)
+		ui.add("scroll-up", rect{X: track.X - 4, Y: track.Y, Width: track.Width + 8, Height: thumbY - track.Y})
+		ui.add("scroll-down", rect{X: track.X - 4, Y: thumbY + thumbH, Width: track.Width + 8, Height: track.Y + track.Height - thumbY - thumbH})
+		rowRight = track.X - 6
 	}
 	for row := 0; row < visible && ui.activityOffset+row < len(transfers); row++ {
-		rr := walk.Rectangle{X: r.X + 12, Y: r.Y + 44 + row*rowH, Width: r.Width - 24, Height: rowH}
+		rr := rect{X: r.X + 12, Y: listTop + row*rowH, Width: rowRight - r.X - 12, Height: rowH}
 		if row > 0 {
-			fill(c, line, walk.Rectangle{X: rr.X + 56, Y: rr.Y, Width: rr.Width - 64, Height: 1})
+			fill(c, line, rect{X: rr.X + 56, Y: rr.Y, Width: rr.Width - 64, Height: 1})
 		}
 		ui.paintTransferRow(c, rr, transfers[ui.activityOffset+row])
 	}
 }
 
-func (ui *nativeDesktopUI) paintTransferRow(c *walk.Canvas, r walk.Rectangle, t TransferView) {
+func (ui *nativeDesktopUI) paintTransferRow(c *painter, r rect, t TransferView) {
 	self := ui.client.session.DeviceID
 	incoming := t.ReceiverID == self
-	circle := walk.Rectangle{X: r.X + 8, Y: r.Y + 11, Width: 36, Height: 36}
+	circle := rect{X: r.X + 8, Y: r.Y + 12, Width: 36, Height: 36}
 	g, fg, bg := glyphUpload, primary, primarySoft
 	if incoming {
 		g, fg, bg = glyphDownload, success, successSoft
@@ -739,17 +865,17 @@ func (ui *nativeDesktopUI) paintTransferRow(c *walk.Canvas, r walk.Rectangle, t 
 
 	active := t.State == "ACCEPTED" || t.State == "TRANSFERRING" || t.State == "VERIFYING" || (t.State == "PAUSED" && t.ReceivedBytes > 0)
 	if active && t.TotalBytes > 0 {
-		barW := 150
-		bar := walk.Rectangle{X: right - barW - 4, Y: r.Y + 22, Width: barW, Height: 6}
+		barW := 160
+		bar := rect{X: right - barW - 4, Y: r.Y + 22, Width: barW, Height: 6}
 		rounded(c, subtleBG, bar, 6)
 		progress := bar
 		progress.Width = int(int64(barW) * t.ReceivedBytes / t.TotalBytes)
 		if progress.Width > 0 {
-			color := primary
+			barColor := primary
 			if t.State == "PAUSED" {
-				color = warning
+				barColor = warning
 			}
-			rounded(c, color, progress, 6)
+			rounded(c, barColor, progress, 6)
 		}
 		detail := fmt.Sprintf("%d%%", t.ReceivedBytes*100/t.TotalBytes)
 		if speed := ui.speeds[t.ID]; speed.rate > 0 && t.State == "TRANSFERRING" {
@@ -757,23 +883,23 @@ func (ui *nativeDesktopUI) paintTransferRow(c *walk.Canvas, r walk.Rectangle, t 
 		} else if t.State != "TRANSFERRING" {
 			detail += " · " + translateTransferState(t.State)
 		}
-		label(c, detail, ui.font(8, false), muted, walk.Rectangle{X: bar.X, Y: r.Y + 30, Width: barW, Height: 18}, oneLine)
+		label(c, detail, ui.font(8, false), muted, rect{X: bar.X, Y: r.Y + 30, Width: barW, Height: 20}, oneLine)
 		right = bar.X - 12
 	} else {
 		text, pfg, pbg := translateTransferState(t.State), muted, subtleBG
 		switch t.State {
 		case "COMPLETED":
-			text, pfg, pbg = "Concluída", success, successSoft
+			text, pfg, pbg = "Concluído", success, successSoft
 			if !incoming {
-				text = "Pronta no celular"
+				text = "Pronto no celular"
 				if len(t.Files) > 0 && !t.Files[0].DownloadAvailable {
-					text, pfg, pbg = "Link expirado", muted, subtleBG
+					text, pfg, pbg = "Não está mais disponível", muted, subtleBG
 				}
 			}
 		case "WAITING_ACCEPTANCE":
-			text, pfg, pbg = "Aguardando o celular", warning, warningSoft
+			text, pfg, pbg = "Esperando o celular", warning, warningSoft
 			if incoming {
-				text = "Aguardando você"
+				text = "Esperando você"
 			}
 		case "FAILED", "REJECTED", "CANCELLED":
 			pfg, pbg = danger, dangerSoft
@@ -791,90 +917,113 @@ func (ui *nativeDesktopUI) paintTransferRow(c *walk.Canvas, r walk.Rectangle, t 
 	sub := direction + peer + " · " + formatNativeBytes(t.TotalBytes) + " · " + relativeTime(t.CreatedAt)
 	if t.FailureMessage != nil && t.State == "FAILED" {
 		sub = *t.FailureMessage
+	} else if !incoming && t.State == "COMPLETED" && len(t.Files) > 0 && !t.Files[0].DownloadAvailable {
+		sub = "Envie de novo se o celular ainda precisar · " + relativeTime(t.CreatedAt)
 	}
-	label(c, transferFileSummary(t.Files), ui.font(9, true), ink, walk.Rectangle{X: x, Y: r.Y + 10, Width: w, Height: 20}, oneLine)
-	label(c, sub, ui.font(8, false), muted, walk.Rectangle{X: x, Y: r.Y + 30, Width: w, Height: 18}, oneLine)
+	label(c, transferFileSummary(t.Files), ui.font(9, true), ink, rect{X: x, Y: r.Y + 9, Width: w, Height: 22}, oneLine)
+	label(c, sub, ui.font(8, false), muted, rect{X: x, Y: r.Y + 31, Width: w, Height: 20}, oneLine)
 }
 
 // ---------------------------------------------------------------- ajustes
 
-func (ui *nativeDesktopUI) paintSettings(c *walk.Canvas, l canvasLayout) {
+func (ui *nativeDesktopUI) paintSettings(c *painter, l canvasLayout) {
 	x, y, w := l.left, l.top, l.width
-	label(c, "Ajustes", ui.font(16, true), ink, walk.Rectangle{X: x, Y: y, Width: 300, Height: 32}, oneLine)
-	ui.button(c, "home", "Voltar", glyphBack, walk.Rectangle{X: x + w - 110, Y: y, Width: 110, Height: 34}, buttonSubtle, true)
+	label(c, "Ajustes", ui.font(16, true), ink, rect{X: x, Y: y, Width: 300, Height: 34}, oneLine)
+	ui.button(c, "home", "Voltar", glyphBack, rect{X: x + w - 116, Y: y, Width: 116, Height: 36}, buttonSubtle, true)
 	y += 48
 	gap := 16
 	colW := (w - gap) / 2
 	settings := ui.snapshot.Settings
 
-	identity := walk.Rectangle{X: x, Y: y, Width: colW, Height: 226}
+	identity := rect{X: x, Y: y, Width: colW, Height: 256}
 	ui.card(c, identity)
-	label(c, "ESTE COMPUTADOR", ui.font(8, true), primary, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 14, Width: 240, Height: 20}, oneLine)
+	label(c, "ESTE COMPUTADOR", ui.font(8, true), primary, rect{X: identity.X + 20, Y: identity.Y + 12, Width: 240, Height: 22}, oneLine)
 	rowW := identity.Width - 40
-	label(c, "Nome que aparece no celular", ui.font(8, false), muted, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 42, Width: rowW - 120, Height: 18}, oneLine)
-	label(c, settings.Device.DisplayName, ui.font(11, true), ink, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 60, Width: rowW - 120, Height: 24}, oneLine)
-	ui.smallButton(c, "rename", "Renomear", identity.X+identity.Width-20, identity.Y+50, buttonSubtle)
-	fill(c, line, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 94, Width: rowW, Height: 1})
-	label(c, "Pasta de recebimento", ui.font(8, false), muted, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 104, Width: rowW, Height: 18}, oneLine)
-	buttons := ui.smallButton(c, "folder-change", "Alterar", identity.X+identity.Width-20, identity.Y+112, buttonSubtle)
-	buttons = ui.smallButton(c, "folder-open", "Abrir", buttons, identity.Y+112, buttonSubtle)
-	label(c, ui.downloadDirectory(), ui.font(9, true), ink, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 122, Width: buttons - identity.X - 24, Height: 22}, walk.TextVCenter|walk.TextSingleLine|walk.TextPathEllipsis)
-	fill(c, line, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 156, Width: rowW, Height: 1})
-	ui.toggle(c, "auto", settings.AutoAcceptTrusted, walk.Rectangle{X: identity.X + identity.Width - 66, Y: identity.Y + 176, Width: 46, Height: 26})
-	label(c, "Aceitar automaticamente", ui.font(9, true), ink, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 166, Width: rowW - 70, Height: 20}, oneLine)
-	label(c, "Arquivos de aparelhos confiáveis entram sem perguntar.", ui.font(8, false), muted, walk.Rectangle{X: identity.X + 20, Y: identity.Y + 186, Width: rowW - 70, Height: 20}, oneLine)
-
-	phone := walk.Rectangle{X: x, Y: identity.Y + identity.Height + gap, Width: colW, Height: 128}
-	ui.card(c, phone)
-	label(c, "ACESSO PELO CELULAR", ui.font(8, true), primary, walk.Rectangle{X: phone.X + 20, Y: phone.Y + 14, Width: 240, Height: 20}, oneLine)
-	label(c, ui.server.localURL(), ui.font(11, true), ink, walk.Rectangle{X: phone.X + 20, Y: phone.Y + 38, Width: phone.Width - 40, Height: 24}, oneLine)
-	label(c, "Abra no navegador do celular, na mesma rede Wi-Fi.", ui.font(8, false), muted, walk.Rectangle{X: phone.X + 20, Y: phone.Y + 62, Width: phone.Width - 40, Height: 18}, oneLine)
-	ui.button(c, "connect", "Mostrar QR", glyphQR, walk.Rectangle{X: phone.X + 20, Y: phone.Y + 84, Width: 140, Height: 32}, buttonPrimary, true)
-	ui.button(c, "copy-url", "Copiar endereço", "", walk.Rectangle{X: phone.X + 170, Y: phone.Y + 84, Width: 150, Height: 32}, buttonSubtle, true)
-
-	trustedHeight := l.bottom - y - 52
-	trusted := walk.Rectangle{X: x + colW + gap, Y: y, Width: w - colW - gap, Height: trustedHeight}
-	ui.card(c, trusted)
-	label(c, "APARELHOS CONFIÁVEIS", ui.font(8, true), primary, walk.Rectangle{X: trusted.X + 20, Y: trusted.Y + 14, Width: 240, Height: 20}, oneLine)
-	if len(ui.peers) == 0 {
-		label(c, "Nenhum aparelho conectado ainda.", ui.font(10, true), ink, walk.Rectangle{X: trusted.X + 20, Y: trusted.Y + 46, Width: trusted.Width - 40, Height: 22}, oneLine)
-		label(c, "Use Conectar celular para parear o primeiro.", ui.font(9, false), muted, walk.Rectangle{X: trusted.X + 20, Y: trusted.Y + 70, Width: trusted.Width - 40, Height: 22}, oneLine)
+	row := func(index int) int { return identity.Y + 40 + index*54 }
+	divider := func(index int) {
+		fill(c, line, rect{X: identity.X + 20, Y: row(index) - 4, Width: rowW, Height: 1})
 	}
-	rows := (trusted.Height - 50) / 52
+	buttonRight := identity.X + identity.Width - 20
+	nameButtons := ui.smallButton(c, "rename", "Renomear", buttonRight, row(0)+6, buttonSubtle)
+	label(c, "Nome que aparece no celular", ui.font(8, false), muted, rect{X: identity.X + 20, Y: row(0), Width: nameButtons - identity.X - 24, Height: 20}, oneLine)
+	label(c, settings.Device.DisplayName, ui.font(11, true), ink, rect{X: identity.X + 20, Y: row(0) + 20, Width: nameButtons - identity.X - 24, Height: 26}, oneLine)
+	divider(1)
+	folderButtons := ui.smallButton(c, "folder-change", "Alterar", buttonRight, row(1)+6, buttonSubtle)
+	folderButtons = ui.smallButton(c, "folder-open", "Abrir", folderButtons, row(1)+6, buttonSubtle)
+	label(c, "Pasta de recebimento", ui.font(8, false), muted, rect{X: identity.X + 20, Y: row(1), Width: folderButtons - identity.X - 24, Height: 20}, oneLine)
+	label(c, ui.downloadDirectory(), ui.font(9, true), ink, rect{X: identity.X + 20, Y: row(1) + 20, Width: folderButtons - identity.X - 24, Height: 24}, dtVCenter|dtSingleLine|dtPathEllipsis)
+	divider(2)
+	toggleX := identity.X + identity.Width - 66
+	ui.toggle(c, "auto", settings.AutoAcceptTrusted, rect{X: toggleX, Y: row(2) + 10, Width: 46, Height: 26})
+	label(c, "Aceitar automaticamente", ui.font(9, true), ink, rect{X: identity.X + 20, Y: row(2) + 2, Width: rowW - 70, Height: 22}, oneLine)
+	label(c, "Arquivos chegam sem pedir confirmação.", ui.font(8, false), muted, rect{X: identity.X + 20, Y: row(2) + 24, Width: rowW - 70, Height: 20}, oneLine)
+	divider(3)
+	ui.toggle(c, "autostart", ui.autostartOn, rect{X: toggleX, Y: row(3) + 10, Width: 46, Height: 26})
+	label(c, "Abrir junto com o Windows", ui.font(9, true), ink, rect{X: identity.X + 20, Y: row(3) + 2, Width: rowW - 70, Height: 22}, oneLine)
+	label(c, "Fica pronto na bandeja ao ligar o PC.", ui.font(8, false), muted, rect{X: identity.X + 20, Y: row(3) + 24, Width: rowW - 70, Height: 20}, oneLine)
+
+	phone := rect{X: x, Y: identity.Y + identity.Height + gap, Width: colW, Height: 112}
+	ui.card(c, phone)
+	label(c, "ACESSO PELO CELULAR", ui.font(8, true), primary, rect{X: phone.X + 20, Y: phone.Y + 12, Width: 240, Height: 22}, oneLine)
+	label(c, ui.addressURL(), ui.font(11, true), ink, rect{X: phone.X + 20, Y: phone.Y + 34, Width: phone.Width - 40, Height: 26}, oneLine)
+	ui.button(c, "connect", "Mostrar QR", glyphQR, rect{X: phone.X + 20, Y: phone.Y + 68, Width: 140, Height: 32}, buttonPrimary, true)
+	ui.button(c, "copy-url", "Copiar endereço", "", rect{X: phone.X + 170, Y: phone.Y + 68, Width: 156, Height: 32}, buttonSubtle, true)
+
+	trustedHeight := l.bottom - y - 96
+	trusted := rect{X: x + colW + gap, Y: y, Width: w - colW - gap, Height: trustedHeight}
+	ui.card(c, trusted)
+	label(c, "MEUS APARELHOS", ui.font(8, true), primary, rect{X: trusted.X + 20, Y: trusted.Y + 12, Width: 240, Height: 22}, oneLine)
+	if len(ui.peers) == 0 {
+		label(c, "Nenhum aparelho conectado ainda.", ui.font(10, true), ink, rect{X: trusted.X + 20, Y: trusted.Y + 44, Width: trusted.Width - 40, Height: 24}, oneLine)
+		label(c, "Use Conectar celular para adicionar o primeiro.", ui.font(9, false), muted, rect{X: trusted.X + 20, Y: trusted.Y + 70, Width: trusted.Width - 40, Height: 24}, oneLine)
+	}
+	rows := (trusted.Height - 50) / 54
 	for i, peer := range ui.peers {
 		if i >= rows {
-			label(c, fmt.Sprintf("e mais %d…", len(ui.peers)-rows), ui.font(8, false), muted, walk.Rectangle{X: trusted.X + 20, Y: trusted.Y + trusted.Height - 26, Width: 200, Height: 18}, oneLine)
+			label(c, fmt.Sprintf("e mais %d…", len(ui.peers)-rows), ui.font(8, false), muted, rect{X: trusted.X + 20, Y: trusted.Y + trusted.Height - 28, Width: 200, Height: 20}, oneLine)
 			break
 		}
-		rr := walk.Rectangle{X: trusted.X + 12, Y: trusted.Y + 42 + i*52, Width: trusted.Width - 24, Height: 52}
-		circle := walk.Rectangle{X: rr.X + 8, Y: rr.Y + 9, Width: 34, Height: 34}
+		rr := rect{X: trusted.X + 12, Y: trusted.Y + 40 + i*54, Width: trusted.Width - 24, Height: 54}
+		circle := rect{X: rr.X + 8, Y: rr.Y + 9, Width: 36, Height: 36}
 		dot(c, subtleBG, circle)
-		g := glyphPhone
-		if !strings.Contains(strings.ToUpper(peer.DeviceType), "MOBILE") && !strings.Contains(strings.ToUpper(peer.DeviceType), "TABLET") {
-			g = glyphDesktop
+		g := glyphDesktop
+		if isMobileType(peer.DeviceType) {
+			g = glyphPhone
 		}
 		ui.glyph(c, g, 11, ink, circle)
 		buttonX := ui.smallButton(c, "revoke|"+peer.DeviceID, "Remover", rr.X+rr.Width-8, rr.Y+11, buttonDanger)
-		label(c, peer.DisplayName, ui.font(9, true), ink, walk.Rectangle{X: rr.X + 54, Y: rr.Y + 7, Width: buttonX - rr.X - 58, Height: 20}, oneLine)
-		state := "Offline · visto " + relativeTime(peer.LastSeenAt)
-		if peer.Online {
-			state = "Online agora"
-		}
-		label(c, state, ui.font(8, false), muted, walk.Rectangle{X: rr.X + 54, Y: rr.Y + 27, Width: buttonX - rr.X - 58, Height: 18}, oneLine)
+		label(c, peer.DisplayName, ui.font(9, true), ink, rect{X: rr.X + 56, Y: rr.Y + 6, Width: buttonX - rr.X - 60, Height: 22}, oneLine)
+		state, stateColor := availability(peer)
+		label(c, state, ui.font(8, false), stateColor, rect{X: rr.X + 56, Y: rr.Y + 28, Width: buttonX - rr.X - 60, Height: 20}, oneLine)
 	}
-	ui.button(c, "quit", "Encerrar o LocalDrop", "", walk.Rectangle{X: trusted.X + trusted.Width - 190, Y: l.bottom - 38, Width: 190, Height: 34}, buttonDanger, true)
-	label(c, "Fechar a janela mantém o LocalDrop pronto na bandeja.", ui.font(8, false), muted, walk.Rectangle{X: x + 4, Y: phone.Y + phone.Height + 12, Width: colW, Height: 18}, oneLine)
-	label(c, "Versão "+version, ui.font(8, false), muted, walk.Rectangle{X: x + 4, Y: phone.Y + phone.Height + 30, Width: colW, Height: 18}, oneLine)
+
+	storageY := trusted.Y + trusted.Height + 14
+	storageText := "Calculando o espaço usado…"
+	if ui.storageBytes >= 0 {
+		storageText = "Espaço usado pelo LocalDrop: " + formatNativeBytes(ui.storageBytes)
+	}
+	storageButton := ui.smallButton(c, "storage-clean", "Limpar", trusted.X+trusted.Width, storageY, buttonSubtle)
+	label(c, storageText, ui.font(9, true), ink, rect{X: trusted.X + 4, Y: storageY - 4, Width: storageButton - trusted.X - 8, Height: 22}, oneLine)
+	label(c, "Seus arquivos salvos não são apagados.", ui.font(8, false), muted, rect{X: trusted.X + 4, Y: storageY + 16, Width: storageButton - trusted.X - 8, Height: 20}, oneLine)
+
+	quit := rect{X: trusted.X + trusted.Width - 200, Y: l.bottom - 38, Width: 200, Height: 36}
+	ui.button(c, "quit", "Encerrar o LocalDrop", "", quit, buttonDanger, true)
+	infoRight := quit.X - 12
+	if releasesURL != "" {
+		infoRight = ui.smallButton(c, "releases", "Ver novidades", infoRight, quit.Y+2, buttonSubtle)
+	}
+	label(c, "Versão "+version, ui.font(8, false), muted,
+		rect{X: trusted.X + 4, Y: quit.Y, Width: infoRight - trusted.X - 8, Height: quit.Height}, oneLine)
 }
 
-func (ui *nativeDesktopUI) paintModal(c *walk.Canvas, b walk.Rectangle) {
-	fill(c, walk.RGB(214, 217, 232), b)
+func (ui *nativeDesktopUI) paintModal(c *painter, b rect) {
+	fill(c, rgb(214, 217, 232), b)
 	p := strings.SplitN(ui.modal, "|", 2)
 	kind, msg := p[0], ""
 	if len(p) > 1 {
 		msg = p[1]
 	}
-	r := walk.Rectangle{X: (b.Width - 460) / 2, Y: (b.Height - 210) / 2, Width: 460, Height: 210}
+	r := rect{X: (b.Width - 480) / 2, Y: (b.Height - 230) / 2, Width: 480, Height: 230}
 	rounded(c, panel, r, 18)
 	title, col := "Aviso", primary
 	if kind == "error" {
@@ -882,14 +1031,14 @@ func (ui *nativeDesktopUI) paintModal(c *walk.Canvas, b walk.Rectangle) {
 	} else if kind == "confirm" {
 		title, col = "Confirmar", warning
 	}
-	fill(c, col, walk.Rectangle{X: r.X, Y: r.Y + 18, Width: 5, Height: r.Height - 36})
-	label(c, title, ui.font(14, true), ink, walk.Rectangle{X: r.X + 28, Y: r.Y + 26, Width: r.Width - 56, Height: 30}, oneLine)
-	label(c, msg, ui.font(10, false), muted, walk.Rectangle{X: r.X + 28, Y: r.Y + 64, Width: r.Width - 56, Height: 76}, walk.TextWordbreak|walk.TextEndEllipsis)
+	fill(c, col, rect{X: r.X, Y: r.Y + 18, Width: 5, Height: r.Height - 36})
+	label(c, title, ui.font(14, true), ink, rect{X: r.X + 28, Y: r.Y + 24, Width: r.Width - 56, Height: 32}, oneLine)
+	label(c, msg, ui.font(10, false), muted, rect{X: r.X + 28, Y: r.Y + 66, Width: r.Width - 56, Height: 92}, wrapped)
 	if kind == "confirm" {
-		ui.button(c, "modal-cancel", "Cancelar", "", walk.Rectangle{X: r.X + r.Width - 242, Y: r.Y + r.Height - 56, Width: 100, Height: 36}, buttonSubtle, true)
-		ui.button(c, "modal-confirm", "Confirmar", "", walk.Rectangle{X: r.X + r.Width - 130, Y: r.Y + r.Height - 56, Width: 104, Height: 36}, buttonPrimary, true)
+		ui.button(c, "modal-cancel", "Cancelar", "", rect{X: r.X + r.Width - 252, Y: r.Y + r.Height - 58, Width: 106, Height: 38}, buttonSubtle, true)
+		ui.button(c, "modal-confirm", "Confirmar", "", rect{X: r.X + r.Width - 136, Y: r.Y + r.Height - 58, Width: 110, Height: 38}, buttonPrimary, true)
 	} else {
-		ui.button(c, "modal-close", "Entendi", "", walk.Rectangle{X: r.X + r.Width - 124, Y: r.Y + r.Height - 56, Width: 98, Height: 36}, buttonPrimary, true)
+		ui.button(c, "modal-close", "Entendi", "", rect{X: r.X + r.Width - 130, Y: r.Y + r.Height - 58, Width: 104, Height: 38}, buttonPrimary, true)
 	}
 }
 
@@ -905,10 +1054,10 @@ func (ui *nativeDesktopUI) alive() bool {
 }
 
 func (ui *nativeDesktopUI) synchronize(action func()) {
-	if ui.window == nil || !ui.alive() {
+	if !ui.alive() {
 		return
 	}
-	ui.window.Synchronize(func() {
+	ui.queue.post(func() {
 		if ui.alive() {
 			action()
 		}
@@ -919,9 +1068,10 @@ func (ui *nativeDesktopUI) setStatus(s string) {
 	ui.synchronize(func() { ui.status = s; ui.invalidate() })
 }
 
-func (ui *nativeDesktopUI) showError(a string, e error) {
-	log.Printf("interface nativa: %s: %v", a, e)
-	ui.synchronize(func() { ui.modal = "error|" + a + "\n" + e.Error(); ui.invalidate() })
+func (ui *nativeDesktopUI) showError(action string, e error) {
+	log.Printf("interface nativa: %s: %v", action, e)
+	explained := explainError(e)
+	ui.synchronize(func() { ui.modal = "error|" + explained.Title + "\n" + explained.Hint; ui.invalidate() })
 }
 
 func (ui *nativeDesktopUI) peerName(id string) string {
@@ -930,7 +1080,7 @@ func (ui *nativeDesktopUI) peerName(id string) string {
 			return d.DisplayName
 		}
 	}
-	return "Dispositivo removido"
+	return "Aparelho removido"
 }
 
 func (ui *nativeDesktopUI) downloadDirectory() string {
@@ -965,11 +1115,10 @@ func (ui *nativeDesktopUI) clampActivity() {
 // shown informa se a janela está visível. Escondida na bandeja ou minimizada,
 // ela não consulta nem redesenha nada.
 func (ui *nativeDesktopUI) shown() bool {
-	if ui.window == nil {
+	if ui.main == nil || ui.main.hwnd == 0 {
 		return false
 	}
-	handle := ui.window.Handle()
-	return win.IsWindowVisible(handle) && !win.IsIconic(handle)
+	return call(procIsWindowVisible, ui.main.hwnd) != 0 && call(procIsIconic, ui.main.hwnd) == 0
 }
 
 // requestRefresh agrupa rajadas de eventos em uma única leitura do estado.
@@ -984,17 +1133,19 @@ func (ui *nativeDesktopUI) requestRefresh() {
 	time.AfterFunc(150*time.Millisecond, func() {
 		ui.refreshMu.Lock()
 		ui.refreshPending = false
-		if !ui.shown() {
-			ui.stale = true
-			ui.refreshMu.Unlock()
-			return
-		}
 		ui.refreshMu.Unlock()
 		if !ui.alive() {
 			return
 		}
-		snapshot := ui.client.snapshot()
-		ui.synchronize(func() { ui.applySnapshot(snapshot) })
+		ui.synchronize(func() {
+			if !ui.shown() {
+				ui.refreshMu.Lock()
+				ui.stale = true
+				ui.refreshMu.Unlock()
+				return
+			}
+			ui.applySnapshot(ui.client.snapshot())
+		})
 	})
 }
 
@@ -1034,6 +1185,17 @@ func (ui *nativeDesktopUI) applySnapshot(s nativeSnapshot) {
 			ui.selectedPeer = ui.peers[0].DeviceID
 		}
 	}
+	if ui.paired != nil {
+		known := false
+		for _, d := range ui.peers {
+			if d.DeviceID == ui.paired.deviceID {
+				known = true
+			}
+		}
+		if !known || time.Since(ui.paired.at) > 2*time.Minute {
+			ui.paired = nil
+		}
+	}
 	ui.incomingOffers = ui.incomingOffers[:0]
 	now := time.Now()
 	if ui.speeds == nil {
@@ -1070,19 +1232,19 @@ func (ui *nativeDesktopUI) applySnapshot(s nativeSnapshot) {
 		}
 	}
 	switch {
+	case ui.health.problem():
+		ui.headerStatus = "O Windows está bloqueando o celular · veja o aviso abaixo"
 	case len(ui.peers) == 0:
-		ui.headerStatus = "Nenhum celular conectado · " + ui.server.localURL()
+		ui.headerStatus = "Nenhum celular conectado ainda"
 	case online == 0:
-		ui.headerStatus = "Pronto para receber · nenhum aparelho online agora"
+		ui.headerStatus = "Pronto para receber · nenhum aparelho disponível agora"
 	case online == 1:
-		ui.headerStatus = "Pronto para receber · 1 aparelho online"
+		ui.headerStatus = "Pronto para receber · 1 aparelho disponível"
 	default:
-		ui.headerStatus = fmt.Sprintf("Pronto para receber · %d aparelhos online", online)
+		ui.headerStatus = fmt.Sprintf("Pronto para receber · %d aparelhos disponíveis", online)
 	}
 	ui.clampActivity()
-	if ui.tray != nil {
-		_ = ui.tray.SetToolTip("LocalDrop · " + ui.headerStatus)
-	}
+	ui.tray.setTooltip("LocalDrop · " + ui.headerStatus)
 	ui.invalidate()
 }
 
@@ -1092,12 +1254,30 @@ func (ui *nativeDesktopUI) onServerEvent(eventType string, payload any) {
 	switch eventType {
 	case "PAIRING_REQUESTED", "TRANSFER_OFFERED", "TRANSFER_COMPLETED":
 		ui.synchronize(func() { ui.notify(eventType, payload) })
+	case "DEVICE_PAIRED":
+		data, _ := payload.(map[string]any)
+		id, _ := data["deviceId"].(string)
+		name, _ := data["displayName"].(string)
+		ui.synchronize(func() {
+			ui.paired = &pairedNotice{deviceID: id, name: name, at: time.Now()}
+			ui.selectedPeer = id
+			ui.addressIndex = 0
+			if ui.qrPopup != nil && !ui.qrPopup.closed {
+				ui.qrPopup.closed = true
+				call(procDestroyWindow, ui.qrPopup.hwnd)
+			}
+			ui.status = name + " foi conectado. Já pode arrastar arquivos para a janela."
+			if !ui.shown() || call(procGetForegroundWindow) != ui.main.hwnd {
+				ui.tray.balloon("Celular conectado", name+" já pode trocar arquivos com este computador.")
+			}
+			ui.invalidate()
+		})
 	}
 }
 
 // notify mostra um aviso do Windows quando a janela não está em primeiro plano.
 func (ui *nativeDesktopUI) notify(eventType string, payload any) {
-	if ui.tray == nil || (ui.shown() && win.GetForegroundWindow() == ui.window.Handle()) {
+	if ui.shown() && call(procGetForegroundWindow) == ui.main.hwnd {
 		return
 	}
 	data, _ := payload.(map[string]any)
@@ -1105,20 +1285,70 @@ func (ui *nativeDesktopUI) notify(eventType string, payload any) {
 	switch eventType {
 	case "PAIRING_REQUESTED":
 		name, _ := data["displayName"].(string)
-		_ = ui.tray.ShowInfo("Novo pedido de conexão", name+" quer se conectar a este computador. Clique para conferir o código.")
+		ui.tray.balloon("Pedido de conexão", name+" quer se conectar. Clique para conferir o código.")
 	case "TRANSFER_OFFERED":
 		t, ok := data["transfer"].(TransferView)
 		if !ok || t.ReceiverID != self || ui.snapshot.Settings.AutoAcceptTrusted {
 			return
 		}
-		_ = ui.tray.ShowInfo("Arquivos chegando", ui.peerName(t.SenderID)+" quer enviar "+transferFileSummary(t.Files)+". Clique para aceitar.")
+		ui.tray.balloon("Arquivos chegando", ui.peerName(t.SenderID)+" quer enviar "+transferFileSummary(t.Files)+". Clique para aceitar.")
 	case "TRANSFER_COMPLETED":
 		t, ok := data["transfer"].(TransferView)
 		if !ok || t.ReceiverID != self {
 			return
 		}
-		_ = ui.tray.ShowInfo("Arquivo recebido", transferFileSummary(t.Files)+" foi salvo em "+filepath.Base(ui.downloadDirectory())+".")
+		ui.tray.balloon("Arquivo recebido", transferFileSummary(t.Files)+" foi salvo em "+filepath.Base(ui.downloadDirectory())+".")
 	}
+}
+
+// checkHealth confere firewall e perfil de rede em segundo plano.
+func (ui *nativeDesktopUI) checkHealth(force bool) {
+	if ui.healthChecking || (!force && time.Since(ui.healthAt) < 30*time.Second) {
+		return
+	}
+	ui.healthChecking = true
+	address := ui.addressURL()
+	host := strings.TrimPrefix(address, "http://")
+	if index := strings.LastIndex(host, ":"); index > 0 {
+		host = host[:index]
+	}
+	go func() {
+		health := checkNetworkHealth(host)
+		ui.synchronize(func() {
+			ui.healthChecking = false
+			ui.healthAt = time.Now()
+			ui.health = health
+			ui.applySnapshot(ui.snapshot)
+			if ui.qrPopup != nil {
+				ui.qrPopup.invalidate()
+			}
+		})
+	}()
+}
+
+func (ui *nativeDesktopUI) fixNetwork() {
+	if ui.fixing {
+		return
+	}
+	ui.fixing = true
+	health := ui.health
+	ui.invalidate()
+	go func() {
+		err := fixNetworkAccess(health)
+		ui.synchronize(func() {
+			ui.fixing = false
+			switch {
+			case err == errUserDeclined:
+				ui.status = "Tudo bem. Sem essa permissão, o celular continua bloqueado."
+			case err != nil:
+				ui.showError("liberar a rede", err)
+			default:
+				ui.status = "Pronto. O LocalDrop foi liberado nesta rede."
+			}
+			ui.checkHealth(true)
+			ui.invalidate()
+		})
+	}()
 }
 
 // ---------------------------------------------------------------- ações
@@ -1128,14 +1358,11 @@ func (ui *nativeDesktopUI) chooseFiles() {
 		ui.showMobileConnection()
 		return
 	}
-	d := new(walk.FileDialog)
-	d.Title = "Escolher arquivos para enviar"
-	d.Filter = "Todos os arquivos (*.*)|*.*"
-	ok, e := d.ShowOpenMultiple(ui.window)
-	if e != nil {
-		ui.showError("Não foi possível abrir o seletor de arquivos.", e)
+	paths, ok, err := showOpenDialog(ui.main.hwnd, "Escolher arquivos para enviar", "", false, true)
+	if err != nil {
+		ui.showError("abrir o seletor de arquivos", err)
 	} else if ok {
-		ui.sendPaths(d.FilePaths)
+		ui.sendPaths(paths)
 	}
 }
 
@@ -1172,7 +1399,7 @@ func expandDropped(paths []string) ([]string, error) {
 
 func (ui *nativeDesktopUI) dropFiles(paths []string) {
 	if ui.selectedPeer == "" {
-		ui.modal = "info|Conecte um celular antes de enviar. Use o botão Conectar celular e escaneie o código."
+		ui.modal = "info|Conecte um celular antes de enviar. Clique em Conectar celular e aponte a câmera do celular para o código."
 		ui.invalidate()
 		return
 	}
@@ -1188,18 +1415,37 @@ func (ui *nativeDesktopUI) sendPaths(paths []string) {
 			err = fmt.Errorf("nenhum arquivo foi encontrado na seleção")
 		}
 		if err != nil {
-			ui.showError("Não foi possível preparar o envio.", err)
+			ui.showError("preparar o envio", err)
 			return
 		}
 		if _, err := ui.client.offer(receiver, files); err != nil {
-			ui.showError("Não foi possível oferecer os arquivos.", err)
+			ui.showError("oferecer os arquivos", err)
 			return
 		}
-		count := "1 arquivo"
+		count := "1 arquivo pronto"
 		if len(files) > 1 {
-			count = fmt.Sprintf("%d arquivos", len(files))
+			count = fmt.Sprintf("%d arquivos prontos", len(files))
 		}
-		ui.setStatus(count + " oferecido(s) a " + name + ". Toque em Aceitar no celular para baixar.")
+		ui.setStatus(count + " para " + name + ". No celular, toque em Aceitar para baixar.")
+	}()
+}
+
+func (ui *nativeDesktopUI) sendTextValue(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if len(text) > 1<<20 {
+		ui.modal = "info|O texto passa de 1 MB. Salve-o em um arquivo e arraste o arquivo para a janela."
+		ui.invalidate()
+		return
+	}
+	receiver, name := ui.selectedPeer, ui.peerName(ui.selectedPeer)
+	go func() {
+		if _, err := ui.client.sendText(receiver, text); err != nil {
+			ui.showError("enviar o texto", err)
+			return
+		}
+		ui.setStatus("Texto enviado para " + name + ". No celular, toque em Aceitar para ver.")
 	}()
 }
 
@@ -1207,31 +1453,19 @@ func (ui *nativeDesktopUI) pasteText() {
 	if ui.selectedPeer == "" {
 		return
 	}
-	text, err := walk.Clipboard().Text()
+	text, err := clipboardText(ui.main.hwnd)
 	if err != nil || strings.TrimSpace(text) == "" {
-		ui.status = "A área de transferência não tem texto para enviar."
+		ui.status = "A área de transferência não tem texto. Use Enviar texto para escrever um."
 		ui.invalidate()
 		return
 	}
-	if len(text) > 1<<20 {
-		ui.modal = "info|O texto copiado passa de 1 MB. Salve-o em um arquivo e arraste para a janela."
-		ui.invalidate()
-		return
-	}
-	receiver, name := ui.selectedPeer, ui.peerName(ui.selectedPeer)
-	go func() {
-		if _, err := ui.client.sendText(receiver, text); err != nil {
-			ui.showError("Não foi possível enviar o texto.", err)
-			return
-		}
-		ui.setStatus("Texto enviado para " + name + ".")
-	}()
+	ui.sendTextValue(text)
 }
 
 func (ui *nativeDesktopUI) runTransfer(id, action string) {
 	go func() {
 		if e := ui.client.action(id, action); e != nil {
-			ui.showError("A ação não pôde ser concluída.", e)
+			ui.showError("responder ao envio", e)
 		}
 	}()
 }
@@ -1245,17 +1479,16 @@ func (ui *nativeDesktopUI) savedPath(id string) string {
 }
 
 func (ui *nativeDesktopUI) copyReceivedText(id string) {
-	path := ui.savedPath(id)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(ui.savedPath(id))
 	if err != nil {
-		ui.showError("Não foi possível ler o texto recebido.", err)
+		ui.showError("ler o texto recebido", err)
 		return
 	}
 	if !utf8.Valid(data) {
-		ui.modal = "info|O arquivo não contém texto UTF-8. Use Mostrar na pasta para abri-lo."
+		ui.modal = "info|Esse arquivo não contém texto comum. Use Mostrar na pasta para abri-lo."
 		return
 	}
-	ui.copy(string(data), "Texto recebido copiado para a área de transferência.")
+	ui.copy(string(data), "Texto recebido copiado. Já pode colar onde quiser.")
 }
 
 func (ui *nativeDesktopUI) pair(requestID string, approve bool) {
@@ -1276,20 +1509,20 @@ func (ui *nativeDesktopUI) pair(requestID string, approve bool) {
 			e = ui.client.rejectPairing(pairing.RequestID)
 		}
 		if e != nil {
-			ui.showError("Não foi possível responder ao pareamento.", e)
+			ui.showError("responder ao pedido de conexão", e)
 			return
 		}
 		if approve {
-			ui.setStatus(pairing.DisplayName + " agora é um aparelho confiável.")
+			ui.setStatus(pairing.DisplayName + " agora está conectado.")
 		}
 		ui.requestRefresh()
 	}()
 }
 
-func (ui *nativeDesktopUI) updateSettings(input map[string]any, done string) {
+func (ui *nativeDesktopUI) updateSettings(input settingsUpdate, done string) {
 	go func() {
 		if _, e := ui.client.updateSettings(input); e != nil {
-			ui.showError("Não foi possível salvar o ajuste.", e)
+			ui.showError("salvar o ajuste", e)
 		} else {
 			ui.setStatus(done)
 		}
@@ -1297,65 +1530,62 @@ func (ui *nativeDesktopUI) updateSettings(input map[string]any, done string) {
 	}()
 }
 
-func (ui *nativeDesktopUI) rename() {
-	var dialog *walk.Dialog
-	var edit *walk.LineEdit
-	var accept, cancel *walk.PushButton
-	name := ""
-	err := Dialog{
-		AssignTo: &dialog, Title: "Renomear este computador", DefaultButton: &accept, CancelButton: &cancel,
-		MinSize: Size{Width: 380, Height: 160}, Layout: VBox{Margins: Margins{Left: 18, Top: 16, Right: 18, Bottom: 14}, Spacing: 10},
-		Children: []Widget{
-			Label{Text: "Nome que aparece no celular:"},
-			LineEdit{AssignTo: &edit, Text: ui.snapshot.Settings.Device.DisplayName, MaxLength: 60},
-			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
-				HSpacer{},
-				PushButton{AssignTo: &cancel, Text: "Cancelar", OnClicked: func() { dialog.Cancel() }},
-				PushButton{AssignTo: &accept, Text: "Salvar", OnClicked: func() { name = strings.TrimSpace(edit.Text()); dialog.Accept() }},
-			}},
-		},
-	}.Create(ui.window)
-	if err != nil {
-		ui.showError("Não foi possível abrir a edição do nome.", err)
-		return
-	}
-	_ = dialog.SetIcon(ui.appIcon)
-	if dialog.Run() == walk.DlgCmdOK && name != "" && name != ui.snapshot.Settings.Device.DisplayName {
-		ui.updateSettings(map[string]any{"displayName": name}, "Nome atualizado.")
-	}
-}
-
 func (ui *nativeDesktopUI) chooseFolder() {
-	v, ok, e := pickDirectory(ui.downloadDirectory())
+	v, ok, e := pickDirectory(ui.main.hwnd, ui.downloadDirectory())
 	if e != nil {
-		ui.showError("Não foi possível escolher a pasta.", e)
+		ui.showError("escolher a pasta", e)
 	} else if ok {
-		ui.updateSettings(map[string]any{"downloadDirectory": filepath.Clean(v)}, "Pasta de recebimento atualizada.")
+		clean := filepath.Clean(v)
+		ui.updateSettings(settingsUpdate{DownloadDirectory: &clean}, "Pasta de recebimento atualizada.")
 	}
 }
 
 func (ui *nativeDesktopUI) confirmRevoke(id string) {
 	name := ui.peerName(id)
-	ui.modal = "confirm|Remover " + name + " dos aparelhos confiáveis? Ele precisará parear de novo para trocar arquivos."
-	ui.confirmAction = func() {
-		go func() {
-			if e := ui.client.revoke(id); e != nil {
-				ui.showError("Não foi possível remover o aparelho.", e)
-				return
-			}
-			ui.setStatus(name + " foi removido.")
-			ui.requestRefresh()
-		}()
-	}
+	ui.modal = "confirm|Remover " + name + " dos seus aparelhos? Para trocar arquivos de novo, será preciso conectar outra vez pelo QR Code."
+	ui.confirmAction = func() { ui.revoke(id, name+" foi removido.") }
+}
+
+func (ui *nativeDesktopUI) revoke(id, done string) {
+	go func() {
+		if e := ui.client.revoke(id); e != nil {
+			ui.showError("remover o aparelho", e)
+			return
+		}
+		ui.setStatus(done)
+		ui.requestRefresh()
+	}()
 }
 
 func (ui *nativeDesktopUI) copy(s, msg string) {
-	if e := walk.Clipboard().SetText(s); e != nil {
-		ui.showError("Não foi possível copiar o texto.", e)
+	if e := setClipboardText(ui.main.hwnd, s); e != nil {
+		ui.showError("copiar o texto", e)
 		return
 	}
 	ui.status = msg
 	ui.invalidate()
+}
+
+func (ui *nativeDesktopUI) setAutostartChoice(enabled bool) {
+	ui.server.markAutostartAsked()
+	if err := setAutostart(enabled); err != nil {
+		ui.showError("mudar a abertura com o Windows", err)
+		return
+	}
+	ui.autostartOn = autostartEnabled()
+	if ui.autostartOn {
+		ui.status = "O LocalDrop vai abrir sozinho na bandeja quando o Windows iniciar."
+	} else {
+		ui.status = "O LocalDrop não vai mais abrir com o Windows."
+	}
+}
+
+func (ui *nativeDesktopUI) refreshStorage() {
+	ui.storageBytes = -1
+	go func() {
+		size := ui.server.storageUsage()
+		ui.synchronize(func() { ui.storageBytes = size; ui.invalidate() })
+	}()
 }
 
 func splitHit(id string) (string, string) {
@@ -1370,16 +1600,37 @@ func (ui *nativeDesktopUI) activate(id string) {
 		ui.page = "home"
 	case "settings":
 		ui.page = "settings"
-	case "connect", "connect-chip":
+		ui.autostartOn = autostartEnabled()
+		ui.refreshStorage()
+	case "connect", "connect-chip", "connect-help":
 		ui.showMobileConnection()
 	case "peer":
 		ui.selectedPeer = arg
 	case "drop":
 		ui.chooseFiles()
+	case "send-text":
+		ui.showSendText()
 	case "pair-approve":
 		ui.pair(arg, true)
 	case "pair-reject":
 		ui.pair(arg, false)
+	case "net-fix":
+		ui.fixNetwork()
+	case "net-settings":
+		_ = shellOpen("ms-settings:network-status")
+	case "paired-ok":
+		ui.paired = nil
+	case "paired-undo":
+		if ui.paired != nil {
+			ui.revoke(ui.paired.deviceID, ui.paired.name+" foi desconectado.")
+			ui.paired = nil
+		}
+	case "autostart-yes":
+		ui.setAutostartChoice(true)
+	case "autostart-no", "autostart-never":
+		ui.server.markAutostartAsked()
+	case "autostart":
+		ui.setAutostartChoice(!ui.autostartOn)
 	case "t-accept":
 		ui.runTransfer(arg, "accept")
 	case "t-reject":
@@ -1390,29 +1641,57 @@ func (ui *nativeDesktopUI) activate(id string) {
 		ui.runTransfer(arg, "cancel")
 	case "t-open":
 		if err := openPath(ui.savedPath(arg)); err != nil {
-			ui.showError("Não foi possível abrir o arquivo.", err)
+			ui.showError("abrir o arquivo", err)
 		}
 	case "t-folder":
 		if err := revealPath(ui.savedPath(arg)); err != nil {
-			ui.showError("Não foi possível abrir a pasta.", err)
+			ui.showError("abrir a pasta", err)
 		}
 	case "t-copy":
 		ui.copyReceivedText(arg)
+	case "clear-list":
+		if cleared := ui.client.clearFinished(); cleared > 0 {
+			ui.status = fmt.Sprintf("%d itens tirados da lista. Os arquivos salvos continuam na pasta.", cleared)
+			ui.activityOffset = 0
+		}
+		ui.requestRefresh()
+	case "scroll-up":
+		ui.activityOffset -= ui.activityRows
+		ui.clampActivity()
+	case "scroll-down":
+		ui.activityOffset += ui.activityRows
+		ui.clampActivity()
 	case "rename":
-		ui.rename()
+		ui.showRename()
 	case "folder-change":
 		ui.chooseFolder()
 	case "folder-open":
 		if err := openPath(ui.downloadDirectory()); err != nil {
-			ui.showError("Não foi possível abrir a pasta.", err)
+			ui.showError("abrir a pasta", err)
 		}
 	case "auto":
-		ui.snapshot.Settings.AutoAcceptTrusted = !ui.snapshot.Settings.AutoAcceptTrusted
-		ui.updateSettings(map[string]any{"autoAcceptTrusted": ui.snapshot.Settings.AutoAcceptTrusted}, "Preferência de aceite salva.")
+		value := !ui.snapshot.Settings.AutoAcceptTrusted
+		ui.snapshot.Settings.AutoAcceptTrusted = value
+		message := "Arquivos dos seus aparelhos vão pedir confirmação."
+		if value {
+			message = "Arquivos dos seus aparelhos vão entrar sem perguntar."
+		}
+		ui.updateSettings(settingsUpdate{AutoAcceptTrusted: &value}, message)
 	case "revoke":
 		ui.confirmRevoke(arg)
 	case "copy-url":
-		ui.copy(ui.server.localURL(), "Endereço copiado. Cole no navegador do celular.")
+		ui.copy(ui.addressURL(), "Endereço copiado. Cole no navegador do celular.")
+	case "storage-clean":
+		go func() {
+			ui.server.cleanStorage()
+			ui.synchronize(func() {
+				ui.status = "Cópias temporárias apagadas."
+				ui.refreshStorage()
+				ui.requestRefresh()
+			})
+		}()
+	case "releases":
+		_ = shellOpen(releasesURL)
 	case "quit":
 		ui.quit()
 	case "modal-close", "modal-cancel":
@@ -1427,45 +1706,10 @@ func (ui *nativeDesktopUI) activate(id string) {
 	ui.invalidate()
 }
 
-func (ui *nativeDesktopUI) mouseDown(x, y int, b walk.MouseButton) {
-	if b != walk.LeftButton {
-		return
-	}
-	point := ui.canvas.PointTo96DPI(walk.Point{X: x, Y: y})
-	ui.pressed = ui.hit(point.X, point.Y)
-	ui.canvas.SetFocus()
-	ui.invalidate()
-}
-
-func (ui *nativeDesktopUI) mouseMove(x, y int, _ walk.MouseButton) {
-	point := ui.canvas.PointTo96DPI(walk.Point{X: x, Y: y})
-	n := ui.hit(point.X, point.Y)
-	if n != ui.hover {
-		ui.hover = n
-		ui.invalidate()
-	}
-}
-
-func (ui *nativeDesktopUI) mouseUp(x, y int, b walk.MouseButton) {
-	if b != walk.LeftButton {
-		return
-	}
-	point := ui.canvas.PointTo96DPI(walk.Point{X: x, Y: y})
-	id := ui.hit(point.X, point.Y)
-	same := id != "" && id == ui.pressed
-	ui.pressed = ""
-	if same {
-		ui.activate(id)
-	} else {
-		ui.invalidate()
-	}
-}
-
-func (ui *nativeDesktopUI) mouseWheel(_, _ int, button walk.MouseButton) {
+func (ui *nativeDesktopUI) wheel(delta int) {
 	if ui.page != "home" || ui.modal != "" {
 		return
 	}
-	delta := int16(uint32(button) >> 16)
 	if delta < 0 {
 		ui.activityOffset++
 	} else if delta > 0 {
@@ -1475,242 +1719,502 @@ func (ui *nativeDesktopUI) mouseWheel(_, _ int, button walk.MouseButton) {
 	ui.invalidate()
 }
 
-func (ui *nativeDesktopUI) keyDown(k walk.Key) {
+func (ui *nativeDesktopUI) key(vk int, ctrl, shift bool) bool {
 	if ui.modal != "" {
-		if k == walk.KeyEscape || k == walk.KeyReturn {
-			ui.activate("modal-close")
+		switch vk {
+		case vkEscape:
+			ui.activate("modal-cancel")
+			return true
+		case vkReturn:
+			if ui.main.focus == "" || !ui.main.focusVisible {
+				if strings.HasPrefix(ui.modal, "confirm|") {
+					ui.activate("modal-confirm")
+				} else {
+					ui.activate("modal-close")
+				}
+				return true
+			}
 		}
+		return false
+	}
+	if ctrl {
+		switch vk {
+		case 'V':
+			ui.pasteText()
+			return true
+		case 'O':
+			ui.chooseFiles()
+			return true
+		}
+		return false
+	}
+	switch vk {
+	case vkEscape:
+		if ui.page == "settings" {
+			ui.activate("home")
+			return true
+		}
+	case vkNext, vkDown:
+		if vk == vkNext {
+			ui.activityOffset += ui.activityRows
+		} else {
+			ui.activityOffset++
+		}
+		ui.clampActivity()
+		ui.invalidate()
+		return true
+	case vkPrior, vkUp:
+		if vk == vkPrior {
+			ui.activityOffset -= ui.activityRows
+		} else {
+			ui.activityOffset--
+		}
+		ui.clampActivity()
+		ui.invalidate()
+		return true
+	}
+	return false
+}
+
+// ---------------------------------------------------------------- janelas modais
+
+// popupButtons desenha os botões de rodapé de uma janela modal, da direita para
+// a esquerda, e devolve onde o primeiro ficou.
+type popupButton struct {
+	id, text string
+	kind     buttonKind
+}
+
+func (ui *nativeDesktopUI) paintPopupButtons(c *painter, buttons []popupButton, right, y int) int {
+	for index := len(buttons) - 1; index >= 0; index-- {
+		button := buttons[index]
+		w := ui.textWidth(c, button.text, ui.font(9, true)) + 36
+		if w < 100 {
+			w = 100
+		}
+		ui.button(c, button.id, button.text, "", rect{X: right - w, Y: y, Width: w, Height: 38}, button.kind, true)
+		right -= w + 10
+	}
+	return right
+}
+
+func (ui *nativeDesktopUI) newPopup(title string, width, height int) (*canvasWindow, error) {
+	popup := &canvasWindow{cache: ui.cache, background: canvasBG}
+	style := uint32(wsPopup | wsCaption | wsSysMenu)
+	if err := createCanvasWindow(popup, popupWindowClass, title+" · LocalDrop", style, wsExDlgModalFrame, ui.main.hwnd, width, height); err != nil {
+		return nil, err
+	}
+	applyLocalDropWindowFrame(popup.hwnd)
+	return popup, nil
+}
+
+func (ui *nativeDesktopUI) showMobileConnection() {
+	if ui.qrPopup != nil && !ui.qrPopup.closed {
+		call(procSetForegroundWindow, ui.qrPopup.hwnd)
 		return
 	}
-	if !walk.ControlDown() {
+	popup, err := ui.newPopup("Conectar celular", 500, 690)
+	if err != nil {
+		ui.showError("abrir a conexão do celular", err)
 		return
 	}
-	switch k {
-	case walk.KeyV:
-		ui.pasteText()
-	case walk.KeyO:
-		ui.chooseFiles()
+	ui.qrPopup = popup
+	opened := time.Now()
+	ui.checkHealth(false)
+	popup.paint = func(c *painter, b rect) {
+		ui.target = popup
+		r := rect{X: 18, Y: 16, Width: b.Width - 36, Height: b.Height - 32}
+		rounded(c, panel, r, 18)
+		label(c, "Conectar celular", ui.font(17, true), ink, rect{X: r.X + 28, Y: r.Y + 20, Width: r.Width - 56, Height: 34}, oneLine)
+		label(c, "Abra a câmera do celular e aponte para o código. O celular precisa estar no mesmo Wi-Fi deste computador.", ui.font(9, false), muted, rect{X: r.X + 28, Y: r.Y + 56, Width: r.Width - 56, Height: 46}, wrapped)
+		qr := rect{X: (b.Width - 280) / 2, Y: r.Y + 108, Width: 280, Height: 280}
+		outline(c, line, qr, 14)
+		ui.paintQR(c, qr)
+		_, expires := ui.inviteURL()
+		remaining := time.Until(expires).Round(time.Minute)
+		validity := "Este código funciona uma única vez."
+		if remaining >= time.Minute {
+			validity = fmt.Sprintf("Este código funciona uma única vez e vale por mais %d min.", int(remaining.Minutes()))
+		}
+		label(c, validity, ui.font(8, false), muted, rect{X: r.X + 20, Y: qr.Y + qr.Height + 8, Width: r.Width - 40, Height: 20}, centeredLine)
+		label(c, "Sem câmera? Digite no navegador do celular:", ui.font(8, false), muted, rect{X: r.X + 20, Y: qr.Y + qr.Height + 34, Width: r.Width - 40, Height: 20}, centeredLine)
+		label(c, ui.addressURL(), ui.font(11, true), primary, rect{X: r.X + 20, Y: qr.Y + qr.Height + 54, Width: r.Width - 40, Height: 26}, centeredLine)
+
+		box := rect{X: r.X + 24, Y: qr.Y + qr.Height + 90, Width: r.Width - 48, Height: 104}
+		switch {
+		case ui.health.problem() || ui.fixing:
+			rounded(c, warningSoft, box, 12)
+			title := "O Windows está bloqueando o celular"
+			detail := "O firewall não liberou o LocalDrop. Clique em Corrigir e confirme o aviso do Windows."
+			if ui.health.PublicNetwork {
+				detail = "Este Wi-Fi está como rede pública. Clique em Corrigir para deixá-lo como rede particular e liberar o LocalDrop."
+			}
+			if ui.fixing {
+				title, detail = "Aguardando a permissão do Windows…", "Confirme no aviso do Windows que apareceu na tela."
+			}
+			label(c, title, ui.font(9, true), warning, rect{X: box.X + 16, Y: box.Y + 10, Width: box.Width - 32, Height: 22}, oneLine)
+			label(c, detail, ui.font(8, false), ink, rect{X: box.X + 16, Y: box.Y + 34, Width: box.Width - 150, Height: 62}, wrapped)
+			if !ui.fixing {
+				ui.button(c, "net-fix", "Corrigir", "", rect{X: box.X + box.Width - 120, Y: box.Y + box.Height - 46, Width: 104, Height: 34}, buttonPrimary, true)
+			}
+		case time.Since(opened) > 60*time.Second && ui.server.lastRemoteRequest().Before(opened):
+			rounded(c, subtleBG, box, 12)
+			label(c, "Não está conectando? Confira:", ui.font(9, true), ink, rect{X: box.X + 16, Y: box.Y + 8, Width: box.Width - 32, Height: 22}, oneLine)
+			tips := "• O celular está no mesmo Wi-Fi (não na rede de convidados nem nos dados móveis).\n• Se o computador ou o celular tiver VPN ligada, desligue.\n• Ainda não deu? Clique em Outro endereço e escaneie de novo."
+			label(c, tips, ui.font(8, false), ink, rect{X: box.X + 16, Y: box.Y + 32, Width: box.Width - 32, Height: 70}, wrapped)
+		}
+
+		buttons := []popupButton{{"copy", "Copiar endereço", buttonSubtle}}
+		if len(ui.server.addresses()) > 1 {
+			buttons = append(buttons, popupButton{"other", "Outro endereço", buttonSubtle})
+		}
+		buttons = append(buttons, popupButton{"close", "Pronto", buttonPrimary})
+		ui.paintPopupButtons(c, buttons, r.X+r.Width-24, r.Y+r.Height-60)
 	}
+	popup.activate = func(id string) {
+		switch id {
+		case "copy":
+			ui.copy(ui.addressURL(), "Endereço copiado. Cole no navegador do celular.")
+		case "other":
+			ui.addressIndex++
+			ui.checkHealth(true)
+		case "net-fix":
+			ui.fixNetwork()
+		case "close":
+			popup.closed = true
+			call(procDestroyWindow, popup.hwnd)
+			return
+		}
+		popup.invalidate()
+	}
+	popup.key = func(vk int, _, _ bool) bool {
+		if vk == vkEscape {
+			popup.activate("close")
+			return true
+		}
+		return false
+	}
+	popup.message = func(message uint32, _, _ uintptr) (uintptr, bool) {
+		if message == wmTimer {
+			popup.invalidate()
+			return 0, true
+		}
+		return 0, false
+	}
+	call(procSetTimer, popup.hwnd, timerPopup, 1000, 0)
+	runModal(ui.main.hwnd, popup, nil)
+	ui.qrPopup = nil
+	ui.invalidate()
+}
+
+// textPrompt abre uma janela com um campo de texto e devolve o que foi digitado.
+func (ui *nativeDesktopUI) textPrompt(title, prompt, initial, accept string, multiline bool, limit int) (string, bool) {
+	width, height := 440, 210
+	if multiline {
+		width, height = 560, 420
+	}
+	popup, err := ui.newPopup(title, width, height)
+	if err != nil {
+		ui.showError("abrir a janela", err)
+		return "", false
+	}
+	editArea := rect{X: 32, Y: 70, Width: width - 64, Height: 34}
+	if multiline {
+		editArea.Height = height - 70 - 82
+	}
+	accepted := false
+	var edit *editField
+	finish := func(ok bool) {
+		if popup.closed {
+			return
+		}
+		accepted = ok
+		popup.closed = true
+	}
+	popup.paint = func(c *painter, b rect) {
+		ui.target = popup
+		label(c, prompt, ui.font(10, true), ink, rect{X: 32, Y: 26, Width: b.Width - 64, Height: 30}, oneLine)
+		frame := rect{X: editArea.X - 4, Y: editArea.Y - 4, Width: editArea.Width + 8, Height: editArea.Height + 8}
+		rounded(c, white, frame, 10)
+		border := line
+		if edit != nil && call(procGetFocus) == edit.hwnd {
+			border = primary
+		}
+		outline(c, border, frame, 10)
+		popup.add("edit", frame)
+		hint := ""
+		if multiline {
+			hint = "Ctrl+Enter também envia."
+		}
+		label(c, hint, ui.font(8, false), muted, rect{X: 32, Y: b.Height - 52, Width: 200, Height: 38}, oneLine)
+		ui.paintPopupButtons(c, []popupButton{{"cancel", "Cancelar", buttonSubtle}, {"accept", accept, buttonPrimary}}, b.Width-32, b.Height-56)
+	}
+	popup.activate = func(id string) {
+		switch id {
+		case "cancel":
+			finish(false)
+		case "accept":
+			finish(true)
+		case "edit":
+			edit.focus(false)
+		}
+	}
+	popup.key = func(vk int, _, shift bool) bool {
+		if vk == vkEscape {
+			finish(false)
+			return true
+		}
+		if vk == vkTab {
+			popup.moveFocus(shift)
+			if popup.focus == "edit" {
+				popup.focusVisible = false
+				edit.focus(false)
+			}
+			popup.invalidate()
+			return true
+		}
+		return false
+	}
+	popup.message = func(message uint32, wParam, _ uintptr) (uintptr, bool) {
+		switch message {
+		case wmCtlColorEdit:
+			call(procSetBkColor, wParam, uintptr(white))
+			call(procSetTextColor, wParam, uintptr(ink))
+			return ui.cache.brush(white), true
+		case wmCommand:
+			popup.invalidate()
+		}
+		return 0, false
+	}
+	edit = newEditField(popup, editArea, initial, multiline, limit, ui.font(10, false))
+	if edit == nil {
+		popup.closed = true
+		call(procDestroyWindow, popup.hwnd)
+		return "", false
+	}
+	filter := func(m *msg) bool {
+		if m.Hwnd != edit.hwnd || m.Message != wmKeyDown {
+			return false
+		}
+		switch int(m.WParam) {
+		case vkEscape:
+			finish(false)
+			return true
+		case vkReturn:
+			if !multiline || keyDown(vkControl) {
+				finish(true)
+				return true
+			}
+		case vkTab:
+			call(procSetFocus, popup.hwnd)
+			popup.focus = "edit"
+			popup.moveFocus(keyDown(vkShift))
+			if popup.focus == "edit" {
+				popup.moveFocus(false)
+			}
+			return true
+		}
+		return false
+	}
+	call(procShowWindow, popup.hwnd, swShowNormal)
+	edit.focus(true)
+	var value string
+	popupLoop(ui.main.hwnd, popup, filter, func() { value = edit.text() })
+	return value, accepted
+}
+
+// popupLoop roda a janela modal e lê o resultado antes de ela ser destruída.
+func popupLoop(owner uintptr, popup *canvasWindow, filter func(m *msg) bool, read func()) {
+	call(procEnableWindow, owner, 0)
+	var m msg
+	for !popup.closed {
+		result := int32(call(procGetMessageW, uintptr(unsafe.Pointer(&m)), 0, 0, 0))
+		if result == 0 {
+			call(procPostQuitMessage, m.WParam)
+			break
+		}
+		if result < 0 {
+			break
+		}
+		if filter != nil && filter(&m) {
+			continue
+		}
+		call(procTranslateMessage, uintptr(unsafe.Pointer(&m)))
+		call(procDispatchMessageW, uintptr(unsafe.Pointer(&m)))
+	}
+	if read != nil {
+		read()
+	}
+	call(procEnableWindow, owner, 1)
+	popup.closed = true
+	if windowHandlers[popup.hwnd] != nil {
+		call(procDestroyWindow, popup.hwnd)
+	}
+	call(procSetForegroundWindow, owner)
+}
+
+func (ui *nativeDesktopUI) showRename() {
+	current := ui.snapshot.Settings.Device.DisplayName
+	name, ok := ui.textPrompt("Renomear este computador", "Nome que aparece no celular:", current, "Salvar", false, 60)
+	name = strings.TrimSpace(name)
+	if ok && name != "" && name != current {
+		ui.updateSettings(settingsUpdate{DisplayName: &name}, "Nome atualizado.")
+	}
+	ui.invalidate()
+}
+
+func (ui *nativeDesktopUI) showSendText() {
+	if ui.selectedPeer == "" {
+		ui.showMobileConnection()
+		return
+	}
+	name := ui.peerName(ui.selectedPeer)
+	text, ok := ui.textPrompt("Enviar texto", "Texto ou link para "+name+":", "", "Enviar", true, 1_000_000)
+	if ok {
+		ui.sendTextValue(strings.ReplaceAll(text, "\r\n", "\n"))
+	}
+	ui.invalidate()
 }
 
 // ---------------------------------------------------------------- janela e bandeja
 
-func (ui *nativeDesktopUI) ensureQR() {
-	current := ui.server.localURL()
-	if ui.qrURL == current && ui.qr != nil {
-		return
-	}
-	code, err := qrcode.New(current, qrcode.Medium)
-	if err != nil {
-		return
-	}
-	code.DisableBorder = true
-	large, err := walk.NewBitmapFromImage(code.Image(320))
-	if err != nil {
-		return
-	}
-	small, err := walk.NewBitmapFromImage(code.Image(180))
-	if err != nil {
-		large.Dispose()
-		return
-	}
-	if ui.qr != nil {
-		ui.qr.Dispose()
-	}
-	if ui.qrSmall != nil {
-		ui.qrSmall.Dispose()
-	}
-	ui.qr, ui.qrSmall, ui.qrURL = large, small, current
-}
-
-func (ui *nativeDesktopUI) showMobileConnection() {
-	ui.ensureQR()
-	var dialog *walk.Dialog
-	var surface *walk.CustomWidget
-	var copyR, closeR walk.Rectangle
-	hover := ""
-	paint := func(c *walk.Canvas, _ walk.Rectangle) error {
-		b := surface.ClientBounds()
-		fill(c, canvasBG, b)
-		r := walk.Rectangle{X: 20, Y: 18, Width: b.Width - 40, Height: b.Height - 36}
-		rounded(c, panel, r, 18)
-		label(c, "Conectar celular", ui.font(17, true), ink, walk.Rectangle{X: r.X + 28, Y: r.Y + 24, Width: r.Width - 56, Height: 30}, oneLine)
-		label(c, "Aponte a câmera do celular para o código. Ele precisa estar no mesmo Wi-Fi.", ui.font(9, false), muted, walk.Rectangle{X: r.X + 28, Y: r.Y + 56, Width: r.Width - 56, Height: 36}, walk.TextWordbreak)
-		qr := walk.Rectangle{X: (b.Width - 300) / 2, Y: r.Y + 104, Width: 300, Height: 300}
-		if ui.qr != nil {
-			_ = c.DrawImageStretched(ui.qr, qr)
-		}
-		label(c, "ou digite no navegador do celular:", ui.font(8, false), muted, walk.Rectangle{X: r.X + 28, Y: qr.Y + 314, Width: r.Width - 56, Height: 18}, centeredLine)
-		label(c, ui.server.localURL(), ui.font(11, true), primary, walk.Rectangle{X: r.X + 28, Y: qr.Y + 334, Width: r.Width - 56, Height: 24}, centeredLine)
-		copyR = walk.Rectangle{X: r.X + 28, Y: r.Y + r.Height - 60, Width: 170, Height: 38}
-		closeR = walk.Rectangle{X: r.X + r.Width - 128, Y: r.Y + r.Height - 60, Width: 100, Height: 38}
-		copyBG, closeBG := subtleBG, primary
-		if hover == "copy" {
-			copyBG = walk.RGB(224, 227, 242)
-		}
-		if hover == "close" {
-			closeBG = primaryDark
-		}
-		rounded(c, copyBG, copyR, 10)
-		label(c, "Copiar endereço", ui.font(9, true), ink, copyR, centeredLine)
-		rounded(c, closeBG, closeR, 10)
-		label(c, "Pronto", ui.font(9, true), white, closeR, centeredLine)
-		return nil
-	}
-	hitAt := func(x, y int) string {
-		point := surface.PointTo96DPI(walk.Point{X: x, Y: y})
-		switch {
-		case inside(copyR, point.X, point.Y):
-			return "copy"
-		case inside(closeR, point.X, point.Y):
-			return "close"
-		}
-		return ""
-	}
-	move := func(x, y int, _ walk.MouseButton) {
-		if current := hitAt(x, y); current != hover {
-			hover = current
-			surface.Invalidate()
-		}
-	}
-	click := func(x, y int, button walk.MouseButton) {
-		if button != walk.LeftButton {
-			return
-		}
-		switch hitAt(x, y) {
-		case "copy":
-			ui.copy(ui.server.localURL(), "Endereço copiado. Cole no navegador do celular.")
-		case "close":
-			dialog.Accept()
-		}
-	}
-	size := Size{Width: 480, Height: 640}
-	if e := (Dialog{AssignTo: &dialog, Title: "Conectar celular · LocalDrop", Size: size, MinSize: size, MaxSize: size, FixedSize: true, Layout: edgeToEdgeCanvasLayout(), Children: []Widget{CustomWidget{AssignTo: &surface, PaintMode: PaintBuffered, Paint: paint, InvalidatesOnResize: true, StretchFactor: 1, OnMouseMove: move, OnMouseUp: click}}}).Create(ui.window); e != nil {
-		ui.showError("Não foi possível abrir a conexão do celular.", e)
-		return
-	}
-	_ = dialog.SetIcon(ui.appIcon)
-	applyLocalDropWindowFrame(dialog)
-	dialog.Run()
-}
-
 func (ui *nativeDesktopUI) showWindow() {
-	if ui.window == nil {
+	if ui.main == nil {
 		return
 	}
-	ui.window.Show()
-	handle := ui.window.Handle()
-	if win.IsIconic(handle) {
-		win.ShowWindow(handle, win.SW_RESTORE)
+	hwnd := ui.main.hwnd
+	call(procShowWindow, hwnd, swShow)
+	if call(procIsIconic, hwnd) != 0 {
+		call(procShowWindow, hwnd, swRestore)
 	}
-	win.SetForegroundWindow(handle)
+	call(procSetForegroundWindow, hwnd)
 	ui.resumeIfStale()
 	ui.requestRefresh()
+	ui.checkHealth(false)
 }
 
 func (ui *nativeDesktopUI) hideToTray() {
-	ui.window.Hide()
+	call(procShowWindow, ui.main.hwnd, swHide)
+	ui.server.dropInvite()
 	marker := filepath.Join(ui.server.cfg.StorageRoot, ".tray-hint")
 	if _, err := os.Stat(marker); os.IsNotExist(err) {
 		_ = os.WriteFile(marker, []byte("1"), 0o600)
-		_ = ui.tray.ShowInfo("O LocalDrop continua ativo", "Ele segue pronto para receber arquivos aqui na bandeja. Para encerrar, clique com o botão direito no ícone.")
+		ui.tray.balloon("O LocalDrop continua aberto", "Ele segue pronto para receber arquivos aqui na bandeja. Para fechar de vez, clique com o botão direito no ícone.")
 	}
+	// Sem nada para desenhar, o buffer da tela e a memória livre voltam ao Windows.
+	ui.main.buffer.release()
+	trimMemory()
 }
 
 func (ui *nativeDesktopUI) quit() {
 	ui.quitting = true
-	ui.window.Close()
+	call(procDestroyWindow, ui.main.hwnd)
 }
 
-func (ui *nativeDesktopUI) buildTray() error {
-	tray, err := walk.NewNotifyIcon(ui.window)
-	if err != nil {
+func (ui *nativeDesktopUI) trayMessage(lParam uintptr) {
+	switch uint32(lParam) {
+	case wmLButtonUp, ninBalloonClk:
+		ui.showWindow()
+	case wmRButtonUp, wmContextMenu:
+		switch popupMenu(ui.main.hwnd, []menuItem{{"Abrir o LocalDrop", 1}, {"Conectar celular", 2}, {"", 0}, {"Encerrar", 3}}) {
+		case 1:
+			ui.showWindow()
+		case 2:
+			ui.showWindow()
+			ui.showMobileConnection()
+		case 3:
+			ui.quit()
+		}
+	}
+}
+
+func (ui *nativeDesktopUI) mainMessage(message uint32, wParam, lParam uintptr) (uintptr, bool) {
+	switch message {
+	case msgSynchronize:
+		ui.queue.drain()
+		return 0, true
+	case msgTray:
+		ui.trayMessage(lParam)
+		return 0, true
+	case wmActivate:
+		if loword(wParam) != 0 {
+			ui.resumeIfStale()
+		}
+	case wmSize:
+		if wParam != 1 /* SIZE_MINIMIZED */ {
+			ui.resumeIfStale()
+		}
+	case wmDestroy:
+		ui.closeOnce.Do(func() { close(ui.closed) })
+		ui.tray.remove()
+		call(procPostQuitMessage, 0)
+	}
+	if message == msgTaskbarCreate && msgTaskbarCreate != 0 {
+		ui.tray.add()
+		return 0, true
+	}
+	if message == msgShowRequest && msgShowRequest != 0 {
+		ui.showWindow()
+		return 0, true
+	}
+	return 0, false
+}
+
+func (ui *nativeDesktopUI) build(startHidden bool) error {
+	ui.page = "home"
+	ui.status = "Arraste arquivos para a janela, ou use Enviar texto para mandar um recado."
+	ui.closed = make(chan struct{})
+	ui.cache = newGDICache()
+	ui.storageBytes = -1
+	ui.appIcon = loadAppIcon(32)
+	ui.appIconSmall = loadAppIcon(16)
+	if err := registerClasses(ui.appIcon, ui.appIconSmall); err != nil {
 		return err
 	}
-	ui.tray = tray
-	_ = tray.SetIcon(ui.appIcon)
-	_ = tray.SetToolTip("LocalDrop")
-	tray.MouseUp().Attach(func(_, _ int, button walk.MouseButton) {
-		if button == walk.LeftButton {
-			ui.showWindow()
-		}
-	})
-	tray.MessageClicked().Attach(ui.showWindow)
-	items := []struct {
-		text   string
-		action func()
-	}{
-		{"Abrir o LocalDrop", ui.showWindow},
-		{"Conectar celular", func() { ui.showWindow(); ui.showMobileConnection() }},
-		{"", nil},
-		{"Encerrar", ui.quit},
-	}
-	for _, item := range items {
-		action := walk.NewSeparatorAction()
-		if item.action != nil {
-			action = walk.NewAction()
-			_ = action.SetText(item.text)
-			action.Triggered().Attach(item.action)
-		}
-		if err := tray.ContextMenu().Actions().Add(action); err != nil {
-			return err
-		}
-	}
-	return tray.SetVisible(true)
-}
-
-func (ui *nativeDesktopUI) build() error {
-	ui.page = "home"
-	ui.status = "Arraste arquivos para a janela ou use Ctrl+V para enviar um texto."
-	ui.closed = make(chan struct{})
-	ui.fonts = map[int]*walk.Font{}
-	ui.glyphs = map[int]*walk.Font{}
-	var e error
-	ui.appIcon, e = walk.NewIconFromResourceId(appIconResourceID)
-	if e != nil {
-		return fmt.Errorf("carregar ícone do programa: %w", e)
-	}
-	ui.navIcons, e = loadNativeNavIcons()
-	if e != nil {
-		return fmt.Errorf("carregar ícones de navegação: %w", e)
-	}
-	w := MainWindow{
-		AssignTo: &ui.window, Title: nativeWindowTitle, Size: Size{Width: 1000, Height: 720}, MinSize: Size{Width: 780, Height: 600},
-		Layout: edgeToEdgeCanvasLayout(), OnDropFiles: ui.dropFiles,
-		Children: []Widget{CustomWidget{
-			AssignTo: &ui.canvas, PaintMode: PaintBuffered, Paint: ui.paint, InvalidatesOnResize: true, StretchFactor: 1,
-			OnMouseDown: ui.mouseDown, OnMouseMove: ui.mouseMove, OnMouseUp: ui.mouseUp, OnKeyDown: ui.keyDown,
-		}},
-	}
-	if e = w.Create(); e != nil {
-		return e
-	}
-	if e = ui.window.SetIcon(ui.appIcon); e != nil {
-		ui.window.Dispose()
-		return fmt.Errorf("aplicar ícone do programa: %w", e)
-	}
-	applyLocalDropWindowFrame(ui.window)
-	ui.canvas.MouseWheel().Attach(ui.mouseWheel)
-	if e = ui.buildTray(); e != nil {
-		log.Printf("ícone da bandeja indisponível: %v", e)
-		ui.tray = nil
-	}
-	ui.window.Activating().Attach(ui.resumeIfStale)
-	ui.window.SizeChanged().Attach(ui.resumeIfStale)
-	ui.window.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		if !ui.quitting && ui.tray != nil && reason == walk.CloseReasonUser {
-			*canceled = true
+	ui.main = &canvasWindow{cache: ui.cache, background: canvasBG, minW: 764, minH: 561}
+	ui.target = ui.main
+	ui.main.paint = ui.paint
+	ui.main.activate = ui.activate
+	ui.main.key = ui.key
+	ui.main.wheel = ui.wheel
+	ui.main.message = ui.mainMessage
+	ui.main.dropped = ui.dropFiles
+	ui.main.close = func() bool {
+		if !ui.quitting && ui.tray.added {
 			ui.hideToTray()
-			return
+			return false
 		}
-		ui.closeOnce.Do(func() { close(ui.closed) })
-	})
+		return true
+	}
+	if err := createCanvasWindow(ui.main, mainWindowClass, nativeWindowTitle, wsOverlappedWindow, wsExAcceptFiles, 0, 984, 681); err != nil {
+		return err
+	}
+	ui.queue.mu.Lock()
+	ui.queue.hwnd = ui.main.hwnd
+	ui.queue.mu.Unlock()
+	call(procDragAcceptFiles, ui.main.hwnd, 1)
+	applyLocalDropWindowFrame(ui.main.hwnd)
+	ui.tray = trayIcon{hwnd: ui.main.hwnd, icon: ui.appIconSmall, tooltip: "LocalDrop"}
+	if !ui.tray.add() {
+		log.Printf("ícone da bandeja indisponível")
+	}
+	ui.autostartOn = autostartEnabled()
+	refreshAutostart()
 	ui.applySnapshot(ui.client.snapshot())
-	_ = ui.canvas.SetFocus()
+	if !startHidden || !ui.tray.added {
+		call(procShowWindow, ui.main.hwnd, swShowDefault)
+		call(procUpdateWindow, ui.main.hwnd)
+		call(procSetForegroundWindow, ui.main.hwnd)
+	} else {
+		ui.stale = true
+		trimMemory()
+	}
+	// A primeira conferência de firewall espera a janela aparecer.
+	time.AfterFunc(3*time.Second, func() { ui.synchronize(func() { ui.checkHealth(true) }) })
 	return nil
 }
 
-func (ui *nativeDesktopUI) run() int {
+func (ui *nativeDesktopUI) run() {
 	ui.server.hub.SetLocalListener(ui.client.session.DeviceID, ui.onServerEvent)
 	defer ui.server.hub.SetLocalListener("", nil)
 	go func() {
@@ -1727,44 +2231,40 @@ func (ui *nativeDesktopUI) run() int {
 			}
 		}
 	}()
-	return ui.window.Run()
+	runMessageLoop()
 }
 
 func (ui *nativeDesktopUI) dispose() {
-	if ui.tray != nil {
-		_ = ui.tray.Dispose()
+	ui.tray.remove()
+	for _, icons := range ui.navIcons {
+		disposeNativeNavIcons(icons)
 	}
-	disposeNativeNavIcons(ui.navIcons)
-	if ui.appIcon != nil {
-		ui.appIcon.Dispose()
+	if ui.cache != nil {
+		ui.cache.dispose()
 	}
-	if ui.qr != nil {
-		ui.qr.Dispose()
+	if ui.appIcon != 0 {
+		call(procDestroyIcon, ui.appIcon)
 	}
-	if ui.qrSmall != nil {
-		ui.qrSmall.Dispose()
-	}
-	for _, f := range ui.fonts {
-		f.Dispose()
-	}
-	for _, f := range ui.glyphs {
-		f.Dispose()
+	if ui.appIconSmall != 0 {
+		call(procDestroyIcon, ui.appIconSmall)
 	}
 }
 
-func showDesktopPanel(server *Server, _ string) bool {
+func showDesktopPanel(server *Server, startHidden bool) bool {
+	lockUIThread()
 	client, e := newNativeHostClient(server)
 	if e != nil {
-		log.Printf("criar sessão da interface nativa: %v", e)
+		log.Printf("criar sessão da janela: %v", e)
 		return false
 	}
 	ui := &nativeDesktopUI{server: server, client: client}
-	if e = ui.build(); e != nil {
+	if e = ui.build(startHidden); e != nil {
 		ui.dispose()
-		log.Printf("criar interface nativa: %v", e)
+		log.Printf("criar janela: %v", e)
 		return false
 	}
 	ui.run()
 	ui.dispose()
 	return true
 }
+

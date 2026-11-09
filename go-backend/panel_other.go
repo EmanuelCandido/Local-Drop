@@ -2,4 +2,4 @@
 
 package main
 
-func showDesktopPanel(_ *Server, _ string) bool { return false }
+func showDesktopPanel(_ *Server, _ bool) bool { return false }

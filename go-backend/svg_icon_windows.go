@@ -7,26 +7,25 @@ import (
 	"encoding/xml"
 	"fmt"
 	"image"
-	"image/color"
+	imagecolor "image/color"
 	"io"
 	"math"
 	"strconv"
 	"strings"
 	"unicode"
 
-	"github.com/lxn/walk"
 )
 
 // The supplied SVG files stay as the source of truth. They are parsed and
 // rasterized locally at startup, so the native desktop never needs a browser,
 // WebView or external image service.
 //
-//go:embed assets/home.svg assets/setting.svg assets/arrow-transfer2.svg
+//go:embed assets/setting.svg assets/arrow-transfer2.svg
 var nativeNavIconFiles embed.FS
 
 type nativeNavIcon struct {
-	inactive *walk.Bitmap
-	active   *walk.Bitmap
+	mask   *image.Alpha
+	active *alphaIcon
 }
 
 type svgPoint struct {
@@ -58,9 +57,9 @@ type svgDocument struct {
 	shapes                    []svgShape
 }
 
-func loadNativeNavIcons() (map[string]nativeNavIcon, error) {
+// loadNativeNavIcons rasteriza os SVGs no tamanho exato em pixels da tela.
+func loadNativeNavIcons(pixels int) (map[string]nativeNavIcon, error) {
 	files := map[string]string{
-		"nav-home":     "assets/home.svg",
 		"nav-history":  "assets/arrow-transfer2.svg",
 		"nav-settings": "assets/setting.svg",
 	}
@@ -71,47 +70,20 @@ func loadNativeNavIcons() (map[string]nativeNavIcon, error) {
 			disposeNativeNavIcons(icons)
 			return nil, fmt.Errorf("ler %s: %w", name, err)
 		}
-		mask, err := rasterizeSVGMask(data, 96)
+		mask, err := rasterizeSVGMask(data, pixels)
 		if err != nil {
 			disposeNativeNavIcons(icons)
 			return nil, fmt.Errorf("renderizar %s: %w", name, err)
 		}
-		inactive, err := bitmapFromAlphaMask(mask, color.NRGBA{R: 164, G: 170, B: 208, A: 255})
-		if err != nil {
-			disposeNativeNavIcons(icons)
-			return nil, fmt.Errorf("preparar %s inativo: %w", name, err)
-		}
-		active, err := bitmapFromAlphaMask(mask, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
-		if err != nil {
-			inactive.Dispose()
-			disposeNativeNavIcons(icons)
-			return nil, fmt.Errorf("preparar %s ativo: %w", name, err)
-		}
-		icons[id] = nativeNavIcon{inactive: inactive, active: active}
+		icons[id] = nativeNavIcon{mask: mask, active: newAlphaIcon(mask, 255, 255, 255)}
 	}
 	return icons, nil
 }
 
 func disposeNativeNavIcons(icons map[string]nativeNavIcon) {
 	for _, icon := range icons {
-		if icon.inactive != nil {
-			icon.inactive.Dispose()
-		}
-		if icon.active != nil {
-			icon.active.Dispose()
-		}
+		icon.active.dispose()
 	}
-}
-
-func bitmapFromAlphaMask(mask *image.Alpha, tint color.NRGBA) (*walk.Bitmap, error) {
-	result := image.NewNRGBA(mask.Bounds())
-	for y := mask.Rect.Min.Y; y < mask.Rect.Max.Y; y++ {
-		for x := mask.Rect.Min.X; x < mask.Rect.Max.X; x++ {
-			a := uint16(mask.AlphaAt(x, y).A) * uint16(tint.A) / 255
-			result.SetNRGBA(x, y, color.NRGBA{R: tint.R, G: tint.G, B: tint.B, A: uint8(a)})
-		}
-	}
-	return walk.NewBitmapFromImage(result)
 }
 
 func rasterizeSVGMask(data []byte, size int) (*image.Alpha, error) {
@@ -154,7 +126,7 @@ func rasterizeSVGMask(data []byte, size int) (*image.Alpha, error) {
 				}
 				destinationAlpha := int(mask.AlphaAt(px, py).A)
 				combined := int(sourceAlpha) + destinationAlpha*(255-int(sourceAlpha))/255
-				mask.SetAlpha(px, py, color.Alpha{A: uint8(combined)})
+				mask.SetAlpha(px, py, imagecolor.Alpha{A: uint8(combined)})
 			}
 		}
 	}

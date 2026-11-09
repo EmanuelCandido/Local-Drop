@@ -7,7 +7,7 @@ import "testing"
 func TestSuppliedNavigationSVGsRasterize(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"assets/home.svg", "assets/arrow-transfer2.svg", "assets/setting.svg"} {
+	for _, name := range []string{"assets/arrow-transfer2.svg", "assets/setting.svg"} {
 		name := name
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

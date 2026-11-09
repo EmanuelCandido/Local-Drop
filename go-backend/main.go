@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,10 +16,9 @@ import (
 )
 
 func main() {
-	headless := flag.Bool("headless", false, "não abrir a janela do aplicativo")
-	port := flag.Int("port", 0, "sobrescrever porta HTTP")
-	legacyDirectory := flag.String("import-legacy", "", "importar arquivos CSV exportados da versão Java")
-	importOnly := flag.Bool("import-only", false, "encerrar depois da importação legada")
+	headless := flag.Bool("headless", false, "só o servidor, sem janela nem ícone na bandeja")
+	tray := flag.Bool("tray", false, "abrir direto na bandeja, sem mostrar a janela (usado ao iniciar com o Windows)")
+	port := flag.Int("port", 0, "usar somente esta porta HTTP")
 	flag.Parse()
 
 	cfg, err := loadConfig()
@@ -28,7 +27,7 @@ func main() {
 		return
 	}
 	if *port != 0 {
-		cfg.Port = *port
+		cfg.Port, cfg.PortFixed = *port, true
 	}
 	if *headless {
 		cfg.AutoOpen = false
@@ -40,28 +39,24 @@ func main() {
 		fatalStartup(err)
 		return
 	}
-	if *legacyDirectory != "" {
-		if err := server.ImportLegacy(*legacyDirectory); err != nil {
-			fatalStartup(fmt.Errorf("importar dados da versão Java: %w", err))
-			return
-		}
-		log.Printf("dados da versão Java importados de %s", *legacyDirectory)
-		if *importOnly {
-			return
-		}
+	fixed := 0
+	if cfg.PortFixed {
+		fixed = cfg.Port
 	}
-	address := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
-	listener, err := net.Listen("tcp", address)
+	listener, chosen, err := listenLocalDrop(candidatePorts(server.savedPort(), fixed))
 	if err != nil {
-		if serviceReady(cfg.Port) {
-			if cfg.AutoOpen {
+		var running errAlreadyRunning
+		if errors.As(err, &running) {
+			// Outra instância já atende: traz a janela dela para a frente.
+			if cfg.AutoOpen && !*tray {
 				_ = focusNativeWindow()
 			}
 			return
 		}
-		fatalStartup(fmt.Errorf("não foi possível usar a porta %d: %w", cfg.Port, err))
+		fatalStartup(err)
 		return
 	}
+	server.usePort(chosen)
 
 	httpServer := &http.Server{
 		Handler:           server.Handler(),
@@ -71,31 +66,28 @@ func main() {
 	}
 	server.RecoverTransfers()
 	go func() {
-		ticker := time.NewTicker(time.Hour)
+		// Pausas por inatividade e limpezas leves; nada pesado roda aqui.
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			server.Cleanup()
 		}
 	}()
-	log.Printf("LocalDrop %s pronto em %s (rede: %s)", version, address, server.localURL())
+	log.Printf("LocalDrop %s pronto na porta %d (rede: %s)", version, chosen, server.localURL())
 
 	serveDone := make(chan error, 1)
 	go func() {
 		serveDone <- httpServer.Serve(listener)
 	}()
 
-	if cfg.AutoOpen && showDesktopPanel(server, fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)) {
+	if cfg.AutoOpen {
+		if !showDesktopPanel(server, *tray) {
+			fatalStartup(fmt.Errorf("não foi possível abrir a janela do LocalDrop"))
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(ctx)
 		server.Flush()
-		return
-	}
-	if cfg.AutoOpen {
-		fatalStartup(fmt.Errorf("não foi possível abrir a interface nativa do desktop"))
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(ctx)
 		return
 	}
 
@@ -118,29 +110,33 @@ func main() {
 	}
 }
 
+// configureLogging grava o log na pasta de dados e o mantém pequeno: ao passar
+// de 1 MB, o arquivo vira .old e um novo começa.
 func configureLogging(root string) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return
 	}
-	file, err := os.OpenFile(filepath.Join(root, "localdrop-go.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	path := filepath.Join(root, "localdrop-go.log")
+	if info, err := os.Stat(path); err == nil && info.Size() > 1<<20 {
+		_ = os.Remove(path + ".old")
+		_ = os.Rename(path, path+".old")
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, file))
+	// O arquivo vem primeiro: sem console (-H=windowsgui), escrever no stderr
+	// falha e o MultiWriter pararia antes de gravar o log.
+	log.SetOutput(io.MultiWriter(file, os.Stderr))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-}
-
-func serviceReady(port int) bool {
-	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port))
-	if err != nil {
-		return false
-	}
-	defer response.Body.Close()
-	return response.StatusCode == http.StatusOK
 }
 
 func fatalStartup(err error) {
 	log.Printf("falha de inicialização: %v", err)
-	showFatalError("O LocalDrop não conseguiu iniciar.\n\n" + err.Error())
+	message := err.Error()
+	var api *apiProblem
+	if errors.As(err, &api) {
+		message = api.Message
+	}
+	showFatalError("O LocalDrop não conseguiu abrir.\n\n" + message)
 }

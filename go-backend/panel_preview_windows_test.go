@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/lxn/walk"
 )
 
 // TestRenderDesktopPreview desenha a janela fora da tela e salva PNGs em
@@ -19,12 +17,6 @@ func TestRenderDesktopPreview(t *testing.T) {
 	if directory == "" {
 		t.Skip("defina LOCALDROP_PREVIEW_DIR para gerar as prévias")
 	}
-	// O walk só inicializa pincéis e canetas internos ao criar a primeira janela.
-	host, err := walk.NewMainWindow()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer host.Dispose()
 	server, err := NewServer(testConfig(t))
 	if err != nil {
 		t.Fatal(err)
@@ -33,11 +25,11 @@ func TestRenderDesktopPreview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ui := &nativeDesktopUI{server: server, client: client, closed: make(chan struct{}), fonts: map[int]*walk.Font{}, glyphs: map[int]*walk.Font{}, page: "home"}
-	ui.navIcons, err = loadNativeNavIcons()
-	if err != nil {
-		t.Fatal(err)
-	}
+	cache := newGDICache()
+	defer cache.dispose()
+	ui := &nativeDesktopUI{server: server, client: client, closed: make(chan struct{}), cache: cache, page: "home", storageBytes: 3_400_000}
+	ui.main = &canvasWindow{cache: cache, dpi: 96, background: canvasBG}
+	ui.target = ui.main
 	defer ui.dispose()
 
 	self := client.session.DeviceID
@@ -47,8 +39,8 @@ func TestRenderDesktopPreview(t *testing.T) {
 	settings := settingsResponse{Device: DeviceView{DeviceID: self, DisplayName: "DESKTOP-EMANOEL", Host: true}, DownloadDirectory: &directoryPath}
 	peers := []DeviceView{
 		{DeviceID: self, DisplayName: "DESKTOP-EMANOEL", Host: true, Online: true},
-		{DeviceID: "phone", DisplayName: "Galaxy S23", DeviceType: "MOBILE", Online: true, LastSeenAt: now},
-		{DeviceID: "tablet", DisplayName: "iPad da sala", DeviceType: "TABLET", LastSeenAt: now.Add(-3 * time.Hour)},
+		{DeviceID: "phone", DisplayName: "Celular Android", DeviceType: "MOBILE", Online: true, LastSeenAt: now},
+		{DeviceID: "tablet", DisplayName: "iPad", DeviceType: "TABLET", LastSeenAt: now.Add(-3 * time.Hour)},
 	}
 	file := func(name string, size int64, mime string) TransferFileView {
 		return TransferFileView{ID: name, Name: name, Size: size, MimeType: mime, DownloadAvailable: true}
@@ -57,46 +49,69 @@ func TestRenderDesktopPreview(t *testing.T) {
 	text.SavedPath = &saved
 	pdf := file("relatorio.pdf", 2_400_000, "application/pdf")
 	pdf.SavedPath = &saved
+	expired := file("fotos.zip", 9_000_000, "application/zip")
+	expired.DownloadAvailable = false
 	transfers := []TransferView{
 		{ID: "t1", SenderID: "phone", ReceiverID: self, State: "TRANSFERRING", TotalBytes: 1_800_000_000, ReceivedBytes: 1_130_000_000, CreatedAt: now.Add(-2 * time.Minute), Files: []TransferFileView{file("VID_20261022_1840.mp4", 1_800_000_000, "video/mp4")}},
 		{ID: "t2", SenderID: self, ReceiverID: "phone", State: "WAITING_ACCEPTANCE", TotalBytes: 52_000_000, CreatedAt: now.Add(-5 * time.Minute), Files: []TransferFileView{file("fotos-viagem.zip", 52_000_000, "application/zip")}},
 		{ID: "t3", SenderID: "phone", ReceiverID: self, State: "COMPLETED", TotalBytes: 320, CreatedAt: now.Add(-40 * time.Minute), Files: []TransferFileView{text}},
-		{ID: "t4", SenderID: self, ReceiverID: "tablet", State: "COMPLETED", TotalBytes: 8_400_000, CreatedAt: now.Add(-26 * time.Hour), Files: []TransferFileView{file("apresentacao.pptx", 8_400_000, "application/vnd.ms-powerpoint"), file("notas.docx", 30_000, "application/msword")}},
+		{ID: "t4", SenderID: self, ReceiverID: "tablet", State: "COMPLETED", TotalBytes: 9_000_000, CreatedAt: now.Add(-26 * time.Hour), Files: []TransferFileView{expired}},
 		{ID: "t5", SenderID: "phone", ReceiverID: self, State: "COMPLETED", TotalBytes: 2_400_000, CreatedAt: now.Add(-28 * time.Hour), Files: []TransferFileView{pdf}},
+		{ID: "t6", SenderID: "phone", ReceiverID: self, State: "FAILED", TotalBytes: 2_400_000, CreatedAt: now.Add(-30 * time.Hour), Files: []TransferFileView{file("planilha.xlsx", 80_000, "application/vnd.ms-excel")}},
 	}
 	ui.speeds = map[string]transferSpeed{"t1": {rate: 38_500_000}}
 
-	render := func(name string, size walk.Size, prepare func()) {
+	render := func(name string, width, height, dpi int, prepare func()) {
 		prepare()
-		bitmap, err := walk.NewBitmapForDPI(size, 96)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer bitmap.Dispose()
-		canvas, err := walk.NewCanvasFromImage(bitmap)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ui.paintBounds(canvas, walk.Rectangle{Width: size.Width, Height: size.Height})
-		canvas.Dispose()
-		image, err := bitmap.ToImage()
-		if err != nil {
-			t.Fatal(err)
+		ui.main.dpi = dpi
+		scale := float64(dpi) / 96
+		var buffer backBuffer
+		buffer.ensure(0, int32(float64(width)*scale), int32(float64(height)*scale))
+		defer buffer.release()
+		p := newPainter(buffer.dc, dpi, cache)
+		bounds := rect{Width: width, Height: height}
+		ui.main.hits = ui.main.hits[:0]
+		p.fill(canvasBG, bounds)
+		ui.paint(p, bounds)
+		if ui.main.focusVisible {
+			if r, ok := ui.main.focusRect(); ok {
+				p.outlineWidth(primary, rect{X: r.X - 3, Y: r.Y - 3, Width: r.Width + 6, Height: r.Height + 6}, 13, 2, false)
+			}
 		}
 		output, err := os.Create(filepath.Join(directory, name+".png"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer output.Close()
-		if err := png.Encode(output, image); err != nil {
+		if err := png.Encode(output, buffer.image()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	full := nativeSnapshot{Devices: peers, Transfers: transfers, Settings: settings, Pairings: []pairingView{{RequestID: "p1", DisplayName: "Moto G84", Code: "482 913"}}}
-	render("inicio", walk.Size{Width: 984, Height: 681}, func() { ui.page = "home"; ui.applySnapshot(full) })
-	render("inicio-minimo", walk.Size{Width: 764, Height: 561}, func() { ui.page = "home"; ui.applySnapshot(full) })
-	render("primeiro-uso", walk.Size{Width: 984, Height: 681}, func() {
+	full := nativeSnapshot{Devices: peers, Transfers: transfers, Settings: settings, Pairings: []pairingView{{RequestID: "p1", DisplayName: "Moto G84", Code: "482913"}}}
+	render("inicio", 984, 681, 96, func() { ui.page = "home"; ui.applySnapshot(full) })
+	render("inicio-minimo", 764, 561, 96, func() { ui.page = "home"; ui.applySnapshot(full) })
+	render("inicio-150dpi", 984, 681, 144, func() {
+		ui.page = "home"
+		ui.applySnapshot(full)
+		ui.main.focus, ui.main.focusVisible = "send-text", true
+	})
+	render("rede-bloqueada", 984, 681, 96, func() {
+		ui.main.focusVisible = false
+		ui.health = networkHealth{Checked: true, PublicNetwork: true}
+		ui.paired = &pairedNotice{deviceID: "phone", name: "Celular Android", at: time.Now()}
+		ui.applySnapshot(nativeSnapshot{Devices: peers, Transfers: transfers[:2], Settings: settings})
+	})
+	render("primeiro-uso", 984, 681, 96, func() {
+		ui.health, ui.paired = networkHealth{}, nil
 		ui.applySnapshot(nativeSnapshot{Devices: peers[:1], Settings: settings})
 	})
-	render("ajustes", walk.Size{Width: 984, Height: 681}, func() { ui.page = "settings"; ui.applySnapshot(full) })
+	render("ajustes", 984, 681, 96, func() { ui.page = "settings"; ui.applySnapshot(full) })
+	render("ajustes-minimo", 764, 561, 96, func() { ui.page = "settings"; ui.applySnapshot(full) })
+	render("aviso", 984, 681, 96, func() {
+		ui.page = "home"
+		ui.applySnapshot(full)
+		explained := explainError(problem(422, "INSUFFICIENT_STORAGE", ""))
+		ui.modal = "error|" + explained.Title + "\n" + explained.Hint
+	})
+	ui.modal = ""
 }

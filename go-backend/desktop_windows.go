@@ -8,47 +8,27 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
-// focusNativeWindow traz de volta a janela da instância já aberta, inclusive
+// focusNativeWindow pede para a instância já aberta mostrar a janela, mesmo
 // quando ela está escondida na bandeja.
 func focusNativeWindow() error {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	findWindow := user32.NewProc("FindWindowW")
-	showWindow := user32.NewProc("ShowWindow")
-	setForeground := user32.NewProc("SetForegroundWindow")
-	title, _ := syscall.UTF16PtrFromString(nativeWindowTitle)
-	window, _, _ := findWindow.Call(0, uintptr(unsafe.Pointer(title)))
+	window := call(procFindWindowW, uintptr(unsafe.Pointer(utf16Ptr(mainWindowClass))), 0)
 	if window == 0 {
-		return fmt.Errorf("a janela nativa do LocalDrop não foi encontrada")
+		return fmt.Errorf("a janela do LocalDrop não foi encontrada")
 	}
-	showWindow.Call(window, 5) // SW_SHOW
-	showWindow.Call(window, 9) // SW_RESTORE
-	setForeground.Call(window)
+	message := call(procRegisterWindowMessageW, uintptr(unsafe.Pointer(utf16Ptr("LocalDrop.ShowWindow"))))
+	call(procPostMessageW, window, message, 0, 0)
 	return nil
 }
 
 func showFatalError(message string) {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	messageBox := user32.NewProc("MessageBoxW")
-	text, _ := syscall.UTF16PtrFromString(message)
-	title, _ := syscall.UTF16PtrFromString("LocalDrop")
-	_, _, _ = messageBox.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x10)
+	call(procMessageBoxW, 0, uintptr(unsafe.Pointer(utf16Ptr(message))), uintptr(unsafe.Pointer(utf16Ptr("LocalDrop"))), mbIconError)
 }
 
 // openPath abre um arquivo ou pasta com o programa padrão do Windows.
 func openPath(path string) error {
-	if path == "" {
-		return fmt.Errorf("o arquivo não está mais disponível")
-	}
-	verb, _ := windows.UTF16PtrFromString("open")
-	target, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return err
-	}
-	return windows.ShellExecute(0, verb, target, nil, nil, windows.SW_SHOWNORMAL)
+	return shellOpen(path)
 }
 
 // revealPath abre o Explorer com o arquivo selecionado.

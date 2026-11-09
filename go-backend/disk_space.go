@@ -46,14 +46,14 @@ func (s *Server) ensureTransferSpaceLocked(transfer *TransferRecord) error {
 	}
 	destinationPath, err := existingAncestor(destination)
 	if err != nil {
-		return problem(422, "STORAGE_UNAVAILABLE", "Não foi possível verificar a pasta de recebimento.")
+		return problem(422, "STORAGE_UNAVAILABLE", "Não deu para usar a pasta de recebimento. Confira a pasta em Ajustes.")
 	}
 	free, err := availableDiskBytes(destinationPath)
 	if err != nil {
-		return problem(422, "STORAGE_UNAVAILABLE", "Não foi possível verificar o espaço livre.")
+		return problem(422, "STORAGE_UNAVAILABLE", "Não deu para conferir o espaço livre da pasta de recebimento. Confira a pasta em Ajustes.")
 	}
 	if free < saturatingAdd(uint64(remaining), s.cfg.MinimumFreeSpace) {
-		return problem(422, "INSUFFICIENT_STORAGE", "Não há espaço livre suficiente para receber estes arquivos.")
+		return problem(422, "INSUFFICIENT_STORAGE", "O computador está sem espaço livre para receber estes arquivos. Libere espaço e tente de novo.")
 	}
 	return nil
 }

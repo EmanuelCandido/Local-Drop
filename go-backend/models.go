@@ -40,6 +40,8 @@ type PairingRecord struct {
 type HostSettings struct {
 	DownloadDirectory string    `json:"downloadDirectory"`
 	AutoAcceptTrusted bool      `json:"autoAcceptTrusted"`
+	Port              int       `json:"port,omitempty"`
+	AutostartAsked    bool      `json:"autostartAsked,omitempty"`
 	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
@@ -85,6 +87,8 @@ type TransferRecord struct {
 	FailureCode    *string         `json:"failureCode,omitempty"`
 	FailureMessage *string         `json:"failureMessage,omitempty"`
 	Files          []*TransferFile `json:"files"`
+	// HiddenFor guarda quem tirou o envio da própria lista ("Limpar lista").
+	HiddenFor []string `json:"hiddenFor,omitempty"`
 }
 
 type State struct {

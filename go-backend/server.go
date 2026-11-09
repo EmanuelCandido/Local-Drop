@@ -4,23 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"embed"
 	"encoding/hex"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
-
-//go:embed all:web
-var embeddedWeb embed.FS
 
 type contextKey string
 
@@ -58,6 +53,13 @@ type Server struct {
 	urlMu     sync.Mutex
 	urlCache  string
 	urlExpiry time.Time
+
+	inviteMu sync.Mutex
+	invite   *pairingInvite
+
+	// lastRemote guarda (em nanossegundos Unix) o último pedido vindo da rede,
+	// usado para perceber quando o celular não consegue chegar ao computador.
+	lastRemote atomic.Int64
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -91,9 +93,8 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) routes() {
 	// Rotas públicas.
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
-	s.mux.HandleFunc("GET /api/v1/network", s.handleNetwork)
-	s.mux.HandleFunc("GET /api/v1/network/qr", s.handleQR)
 	s.mux.HandleFunc("POST /api/v1/host/claim", s.handleHostClaim)
+	s.mux.HandleFunc("POST /api/v1/pairing/invite", s.handleInviteRedeem)
 	s.mux.HandleFunc("POST /api/v1/pairing/requests", s.handlePairingRequest)
 	s.mux.HandleFunc("GET /api/v1/pairing/requests/{requestId}/status", s.handlePairingPoll)
 	s.mux.HandleFunc("GET /ws/events", s.handleWebSocket)
@@ -108,60 +109,46 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/pairing/requests/{requestId}/approve", s.host(http.HandlerFunc(s.handlePairingApprove)))
 	s.mux.Handle("POST /api/v1/pairing/requests/{requestId}/reject", s.host(http.HandlerFunc(s.handlePairingReject)))
 
-	// Configurações e histórico.
+	// Configurações.
 	s.mux.Handle("GET /api/v1/settings", s.auth(http.HandlerFunc(s.handleSettingsGet)))
 	s.mux.Handle("PATCH /api/v1/settings", s.auth(http.HandlerFunc(s.handleSettingsPatch)))
-	s.mux.Handle("POST /api/v1/settings/download-directory/pick", s.host(http.HandlerFunc(s.handleDirectoryPick)))
-	s.mux.Handle("GET /api/v1/history", s.auth(http.HandlerFunc(s.handleHistory)))
 
 	// Transferências.
 	s.mux.Handle("POST /api/v1/transfers", s.auth(http.HandlerFunc(s.handleTransferCreate)))
 	s.mux.Handle("GET /api/v1/transfers", s.auth(http.HandlerFunc(s.handleTransferList)))
+	s.mux.Handle("POST /api/v1/transfers/clear-finished", s.auth(http.HandlerFunc(s.handleClearFinished)))
 	s.mux.Handle("GET /api/v1/transfers/{transferId}", s.auth(http.HandlerFunc(s.handleTransferView)))
 	s.mux.Handle("POST /api/v1/transfers/{transferId}/{action}", s.auth(http.HandlerFunc(s.handleTransferAction)))
 	s.mux.Handle("GET /api/v1/transfers/{transferId}/files/{fileId}/missing", s.auth(http.HandlerFunc(s.handleMissingChunks)))
 	s.mux.Handle("PUT /api/v1/transfers/{transferId}/files/{fileId}/chunks/{chunkIndex}", s.auth(http.HandlerFunc(s.handleChunkUpload)))
 	s.mux.Handle("GET /api/v1/transfers/{transferId}/files/{fileId}/download", s.auth(http.HandlerFunc(s.handleFileDownload)))
 	s.mux.Handle("POST /api/v1/transfers/{transferId}/files/{fileId}/download-link", s.auth(http.HandlerFunc(s.handleDownloadLink)))
+	s.mux.Handle("POST /api/v1/transfers/{transferId}/download-all-link", s.auth(http.HandlerFunc(s.handleDownloadAllLink)))
 	s.mux.HandleFunc("GET /api/v1/downloads/{ticket}/{name}", s.handleTicketDownload)
 
-	// A mesma interface React é usada na janela desktop e nos navegadores móveis.
+	// A interface do celular, embutida no executável já comprimida.
 	s.mux.Handle("GET /", embeddedWebHandler())
 }
 
-func embeddedWebHandler() http.Handler {
-	root, err := fs.Sub(embeddedWeb, "web")
-	if err != nil {
-		panic(fmt.Sprintf("carregar interface web: %v", err))
-	}
-	files := http.FileServer(http.FS(root))
+func (s *Server) Handler() http.Handler {
+	return s.trackRemote(s.securityHeaders(s.recoverPanics(s.mux)))
+}
+
+func (s *Server) trackRemote(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assetPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
-		if assetPath == "." || assetPath == "" {
-			assetPath = "index.html"
+		if !isLoopbackRequest(r) {
+			s.lastRemote.Store(time.Now().UnixNano())
 		}
-		if _, err := fs.Stat(root, assetPath); err != nil {
-			if strings.HasPrefix(assetPath, "api/") || strings.HasPrefix(assetPath, "ws/") || strings.HasPrefix(assetPath, "downloads/") || path.Ext(assetPath) != "" {
-				http.NotFound(w, r)
-				return
-			}
-			clone := r.Clone(r.Context())
-			clone.URL.Path = "/"
-			w.Header().Set("Cache-Control", "no-cache")
-			files.ServeHTTP(w, clone)
-			return
-		}
-		if strings.HasPrefix(assetPath, "assets/") {
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		} else if assetPath == "index.html" || assetPath == "sw.js" {
-			w.Header().Set("Cache-Control", "no-cache")
-		}
-		files.ServeHTTP(w, r)
+		next.ServeHTTP(w, r)
 	})
 }
 
-func (s *Server) Handler() http.Handler {
-	return s.securityHeaders(s.recoverPanics(s.mux))
+// lastRemoteRequest informa quando o último pedido de outro aparelho chegou.
+func (s *Server) lastRemoteRequest() time.Time {
+	if value := s.lastRemote.Load(); value != 0 {
+		return time.Unix(0, value)
+	}
+	return time.Time{}
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
@@ -170,7 +157,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -202,7 +189,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 func (s *Server) host(next http.Handler) http.Handler {
 	return s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !principalOf(r).Host {
-			writeProblem(w, r, problem(403, "DEVICE_ACCESS_DENIED", "Acesso permitido somente ao computador host."))
+			writeProblem(w, r, problem(403, "DEVICE_ACCESS_DENIED", "Só o computador pode fazer isso."))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -213,7 +200,7 @@ func (s *Server) authenticate(r *http.Request) (Principal, error) {
 	deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id"))
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if deviceID == "" || !strings.HasPrefix(authorization, "Device ") {
-		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Autenticação do dispositivo é obrigatória.")
+		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Este aparelho não está conectado ao computador. Escaneie o QR Code de novo.")
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Device "))
 	hash := sha256.Sum256([]byte(token))
@@ -221,11 +208,11 @@ func (s *Server) authenticate(r *http.Request) (Principal, error) {
 	defer s.mu.Unlock()
 	device := s.state.Devices[deviceID]
 	if device == nil || device.Revoked {
-		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Autenticação do dispositivo é inválida.")
+		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Este aparelho foi desconectado do computador. Escaneie o QR Code de novo.")
 	}
 	expected, err := hex.DecodeString(device.TokenHash)
 	if err != nil || len(expected) != len(hash) || subtle.ConstantTimeCompare(hash[:], expected) != 1 {
-		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Autenticação do dispositivo é inválida.")
+		return Principal{}, problem(401, "DEVICE_AUTHENTICATION_REQUIRED", "Este aparelho foi desconectado do computador. Escaneie o QR Code de novo.")
 	}
 	device.LastSeenAt = time.Now().UTC()
 	return Principal{DeviceID: deviceID, Host: device.Host}, nil
