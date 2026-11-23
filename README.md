@@ -191,3 +191,7 @@ O conteúdo dos arquivos nunca entra no JSON. Enquanto chega, um arquivo fica co
 - [Segurança](docs/SECURITY.md)
 - [Solução de problemas](docs/TROUBLESHOOTING.md)
 - [Guia visual](DESIGN.md)
+
+## Licença
+
+[MIT](LICENSE)
