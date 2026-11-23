@@ -16,7 +16,6 @@ export function PairingRequests({ requests, busyId, onApprove, onReject }: Props
       <div className="pairing-content">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">SUA APROVAÇÃO</p>
             <h2 id="pairing-title">Quem pode entrar?</h2>
             <p>Confira o nome e o código antes de confiar no dispositivo.</p>
           </div>
@@ -36,7 +35,7 @@ export function PairingRequests({ requests, busyId, onApprove, onReject }: Props
                   <small>{isMobile ? 'Navegador móvel' : 'Navegador desktop'}</small>
                 </div>
                 <div className="pair-code">
-                  <small>CÓDIGO</small>
+                  <small>Código</small>
                   <b>{request.code.replace(/(\d{3})(\d{3})/, '$1 $2')}</b>
                 </div>
                 <div className="pair-actions">

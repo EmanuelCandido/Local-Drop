@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-
 )
 
 // The supplied SVG files stay as the source of truth. They are parsed and
@@ -25,7 +24,8 @@ var nativeNavIconFiles embed.FS
 
 type nativeNavIcon struct {
 	mask   *image.Alpha
-	active *alphaIcon
+	active *alphaIcon // branco, sobre fundos de cor
+	ink    *alphaIcon // escuro, sobre fundos claros
 }
 
 type svgPoint struct {
@@ -75,7 +75,7 @@ func loadNativeNavIcons(pixels int) (map[string]nativeNavIcon, error) {
 			disposeNativeNavIcons(icons)
 			return nil, fmt.Errorf("renderizar %s: %w", name, err)
 		}
-		icons[id] = nativeNavIcon{mask: mask, active: newAlphaIcon(mask, 255, 255, 255)}
+		icons[id] = nativeNavIcon{mask: mask, active: newAlphaIcon(mask, 255, 255, 255), ink: newAlphaIcon(mask, 27, 31, 51)}
 	}
 	return icons, nil
 }
@@ -83,6 +83,9 @@ func loadNativeNavIcons(pixels int) (map[string]nativeNavIcon, error) {
 func disposeNativeNavIcons(icons map[string]nativeNavIcon) {
 	for _, icon := range icons {
 		icon.active.dispose()
+		if icon.ink != nil {
+			icon.ink.dispose()
+		}
 	}
 }
 

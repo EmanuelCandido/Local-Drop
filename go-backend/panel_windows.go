@@ -47,7 +47,7 @@ func computeCanvasLayout(b rect) canvasLayout {
 	if width < 0 {
 		width = 0
 	}
-	header := 72
+	header := 64
 	top := header + 20
 	bottom := b.Height - 34
 	if bottom < top {
@@ -64,23 +64,26 @@ type homeLayout struct {
 }
 
 // computeHomeLayout empilha avisos, destinos, área de envio e atividade. A
-// atividade ocupa o que sobrar até o rodapé.
+// atividade ocupa o que sobrar até o rodapé. Com aparelhos conectados, destinos
+// e área de envio ficam colados: são o mesmo cartão de envio.
 func computeHomeLayout(l canvasLayout, banners int, onboarding bool) homeLayout {
 	var result homeLayout
 	y := l.top
 	for index := 0; index < banners; index++ {
-		result.banners = append(result.banners, rect{X: l.left, Y: y, Width: l.width, Height: 64})
-		y += 76
+		result.banners = append(result.banners, rect{X: l.left, Y: y, Width: l.width, Height: 60})
+		y += 72
 	}
-	devicesHeight := 86
+	devicesHeight, devicesGap := 64, 0
 	if onboarding {
-		devicesHeight = 216
+		devicesHeight, devicesGap = 216, 16
 	}
 	result.devices = rect{X: l.left, Y: y, Width: l.width, Height: devicesHeight}
-	y += devicesHeight + 16
+	y += devicesHeight + devicesGap
 	dropHeight := 116
-	if l.bottom-y < dropHeight+16+180 {
-		dropHeight = 84
+	if onboarding {
+		dropHeight = 92
+	} else if l.bottom-y < dropHeight+16+260 {
+		dropHeight = 92
 	}
 	result.drop = rect{X: l.left, Y: y, Width: l.width, Height: dropHeight}
 	y += dropHeight + 16
@@ -92,27 +95,29 @@ func computeHomeLayout(l canvasLayout, banners int, onboarding bool) homeLayout 
 	return result
 }
 
+// Paleta igual às variáveis de frontend/src/style.css (tema claro).
 var (
-	canvasBG    = rgb(243, 245, 250)
+	canvasBG    = rgb(244, 245, 248)
 	ink         = rgb(27, 31, 51)
 	muted       = rgb(78, 86, 112) // contraste de cerca de 7:1 sobre branco
-	sidebar     = rgb(25, 28, 49)
-	sidebarSoft = rgb(43, 47, 79)
-	headerMuted = rgb(186, 191, 224)
 	primary     = rgb(100, 86, 231)
 	primaryDark = rgb(79, 66, 197)
 	primarySoft = rgb(238, 235, 255)
+	primaryLine = rgb(196, 190, 242)
 	panel       = rgb(255, 255, 255)
-	line        = rgb(228, 231, 241)
+	line        = rgb(226, 229, 238)
 	success     = rgb(22, 128, 90)
 	successSoft = rgb(225, 245, 236)
 	warning     = rgb(166, 98, 10)
 	warningSoft = rgb(253, 242, 224)
 	danger      = rgb(196, 54, 68)
 	dangerSoft  = rgb(252, 233, 235)
-	subtleBG    = rgb(236, 238, 247)
+	subtleBG    = rgb(238, 240, 246)
+	subtleHover = rgb(226, 229, 240)
+	disabledBG  = rgb(238, 240, 245)
+	disabledInk = rgb(140, 146, 166)
 	white       = rgb(255, 255, 255)
-	shadow      = rgb(232, 235, 245)
+	offlineDot  = rgb(160, 166, 186)
 )
 
 // Glifos da fonte Segoe MDL2 Assets, presente no Windows 10 e 11.
@@ -144,7 +149,7 @@ const (
 	buttonPrimary buttonKind = iota
 	buttonSubtle
 	buttonDanger
-	buttonHeader
+	buttonOnTint // secundário sobre faixas coloridas (avisos)
 )
 
 type transferSpeed struct {
@@ -289,11 +294,11 @@ func (ui *nativeDesktopUI) font(size int, bold bool) font {
 
 func (ui *nativeDesktopUI) glyphFont(size int) font { return font{points: float64(size), glyph: true} }
 
-func fill(c *painter, col color, r rect)               { c.fill(col, r) }
-func rounded(c *painter, col color, r rect, rad int)   { c.rounded(col, r, rad) }
-func outline(c *painter, col color, r rect, rad int)   { c.outline(col, r, rad) }
+func fill(c *painter, col color, r rect)                   { c.fill(col, r) }
+func rounded(c *painter, col color, r rect, rad int)       { c.rounded(col, r, rad) }
+func outline(c *painter, col color, r rect, rad int)       { c.outline(col, r, rad) }
 func dashedOutline(c *painter, col color, r rect, rad int) { c.dashed(col, r, rad) }
-func dot(c *painter, col color, r rect)                { c.dot(col, r) }
+func dot(c *painter, col color, r rect)                    { c.dot(col, r) }
 
 func label(c *painter, s string, f font, col color, r rect, format uint32) {
 	c.text(s, f, col, r, format)
@@ -321,13 +326,16 @@ func (ui *nativeDesktopUI) glyph(c *painter, g string, size int, col color, r re
 	label(c, g, ui.glyphFont(size), col, r, centeredLine)
 }
 
+// card é uma superfície branca com contorno fino. Sem sombra: o GDI não
+// desfoca, e uma faixa sólida embaixo parecia borda grossa.
 func (ui *nativeDesktopUI) card(c *painter, r rect) {
-	rounded(c, shadow, rect{X: r.X, Y: r.Y + 2, Width: r.Width, Height: r.Height}, 16)
-	rounded(c, panel, r, 16)
+	rounded(c, panel, r, 14)
+	outline(c, line, r, 14)
 }
 
-// navIcon desenha um dos SVGs fornecidos no tamanho exato em pixels.
-func (ui *nativeDesktopUI) navIcon(c *painter, id string, r rect) {
+// navIcon desenha um dos SVGs fornecidos no tamanho exato em pixels; dark usa
+// a versão escura, para fundos claros.
+func (ui *nativeDesktopUI) navIcon(c *painter, id string, r rect, dark ...bool) {
 	pixels := int(c.px(r.Width))
 	if ui.navIcons == nil {
 		ui.navIcons = map[int]map[string]nativeNavIcon{}
@@ -341,24 +349,25 @@ func (ui *nativeDesktopUI) navIcon(c *painter, id string, r rect) {
 		ui.navIcons[pixels] = loaded
 		icons = loaded
 	}
-	c.icon(icons[id].active, r)
+	icon := icons[id].active
+	if len(dark) > 0 && dark[0] && icons[id].ink != nil {
+		icon = icons[id].ink
+	}
+	c.icon(icon, r)
 }
 
 func (ui *nativeDesktopUI) button(c *painter, id, text, g string, r rect, kind buttonKind, enabled bool) {
-	bg, fg, hover := subtleBG, ink, rgb(224, 227, 242)
+	bg, fg, hover := subtleBG, ink, subtleHover
 	switch kind {
 	case buttonPrimary:
 		bg, fg, hover = primary, white, primaryDark
 	case buttonDanger:
 		bg, fg, hover = dangerSoft, danger, rgb(248, 215, 220)
-	case buttonHeader:
-		bg, fg, hover = sidebarSoft, white, rgb(56, 61, 99)
+	case buttonOnTint:
+		bg, fg, hover = white, ink, subtleBG
 	}
 	if !enabled {
-		bg, fg = rgb(234, 236, 243), rgb(140, 146, 166)
-		if kind == buttonHeader {
-			bg, fg = sidebarSoft, headerMuted
-		}
+		bg, fg = disabledBG, disabledInk
 	} else if ui.hovered(id) {
 		bg = hover
 	}
@@ -426,31 +435,34 @@ func (ui *nativeDesktopUI) paint(c *painter, b rect) {
 	}
 }
 
+// paintHeader é uma faixa clara e baixa: marca e estado à esquerda, conectar e
+// ajustes à direita. O roxo fica para as ações de cada aviso.
 func (ui *nativeDesktopUI) paintHeader(c *painter, l canvasLayout) {
-	fill(c, sidebar, rect{Width: l.bounds.Width, Height: l.header})
-	logo := rect{X: l.left, Y: 17, Width: 38, Height: 38}
-	rounded(c, primary, logo, 12)
+	fill(c, panel, rect{Width: l.bounds.Width, Height: l.header})
+	fill(c, line, rect{Y: l.header - 1, Width: l.bounds.Width, Height: 1})
+	logo := rect{X: l.left, Y: 14, Width: 36, Height: 36}
+	rounded(c, primary, logo, 10)
 	ui.navIcon(c, "nav-history", inset(logo, 8, 8, 8, 8))
-	label(c, "LocalDrop", ui.font(13, true), white, rect{X: logo.X + 50, Y: 12, Width: 260, Height: 26}, oneLine)
+	label(c, "LocalDrop", ui.font(12, true), ink, rect{X: logo.X + 48, Y: 10, Width: 260, Height: 24}, oneLine)
 	statusColor := success
 	if len(ui.peers) == 0 || ui.health.problem() {
-		statusColor = rgb(240, 170, 60)
+		statusColor = warning
 	}
-	dot(c, statusColor, rect{X: logo.X + 51, Y: 44, Width: 8, Height: 8})
-	label(c, ui.headerStatus, ui.font(8, false), headerMuted, rect{X: logo.X + 65, Y: 37, Width: l.width/2 - 40, Height: 22}, oneLine)
+	dot(c, statusColor, rect{X: logo.X + 49, Y: 40, Width: 7, Height: 7})
+	label(c, ui.headerStatus, ui.font(8, false), muted, rect{X: logo.X + 62, Y: 33, Width: l.width/2 - 40, Height: 20}, oneLine)
 
 	right := l.left + l.width
-	gear := rect{X: right - 40, Y: 16, Width: 40, Height: 40}
-	gearID, bg := "settings", sidebarSoft
+	gear := rect{X: right - 38, Y: 13, Width: 38, Height: 38}
+	gearID, bg := "settings", panel
 	if ui.page == "settings" {
-		gearID, bg = "home", primary
+		gearID, bg = "home", primarySoft
 	} else if ui.hovered(gearID) {
-		bg = rgb(56, 61, 99)
+		bg = subtleBG
 	}
 	rounded(c, bg, gear, 10)
-	ui.navIcon(c, "nav-settings", inset(gear, 10, 10, 10, 10))
+	ui.navIcon(c, "nav-settings", inset(gear, 9, 9, 9, 9), true)
 	ui.add(gearID, gear)
-	ui.button(c, "connect", "Conectar celular", glyphQR, rect{X: gear.X - 196, Y: 16, Width: 186, Height: 40}, buttonPrimary, true)
+	ui.button(c, "connect", "Conectar celular", glyphQR, rect{X: gear.X - 180, Y: 13, Width: 172, Height: 38}, buttonSubtle, true)
 }
 
 // ---------------------------------------------------------------- início
@@ -516,33 +528,39 @@ func (ui *nativeDesktopUI) paintHome(c *painter, l canvasLayout) {
 	if len(ui.peers) == 0 {
 		ui.paintOnboarding(c, layout.devices)
 	} else {
+		// Destinos e área de envio formam um cartão só.
+		ui.card(c, rect{X: layout.devices.X, Y: layout.devices.Y, Width: layout.devices.Width, Height: layout.drop.Y + layout.drop.Height - layout.devices.Y})
 		ui.paintDevices(c, layout.devices)
 	}
 	ui.paintDrop(c, layout.drop)
 	ui.paintActivity(c, layout.activity)
 }
 
-// bannerFrame desenha o cartão do aviso; os botões vêm depois, por cima.
+// bannerFrame desenha o aviso como uma faixa no tom da sua cor, com o ícone num
+// círculo branco; os botões vêm depois, por cima.
 func (ui *nativeDesktopUI) bannerFrame(c *painter, r rect, accent, soft color, g string) {
-	ui.card(c, r)
-	fill(c, accent, rect{X: r.X, Y: r.Y + 12, Width: 4, Height: r.Height - 24})
-	circle := rect{X: r.X + 18, Y: r.Y + 14, Width: 36, Height: 36}
-	dot(c, soft, circle)
+	rounded(c, soft, r, 14)
+	circle := rect{X: r.X + 14, Y: r.Y + (r.Height-34)/2, Width: 34, Height: 34}
+	dot(c, white, circle)
 	ui.glyph(c, g, 12, accent, circle)
 }
 
 // bannerText escreve título e detalhe até onde começam os botões.
 func (ui *nativeDesktopUI) bannerText(c *painter, r rect, title, detail string, textRight int) {
-	width := textRight - (r.X + 66) - 12
-	label(c, title, ui.font(10, true), ink, rect{X: r.X + 66, Y: r.Y + 9, Width: width, Height: 24}, oneLine)
-	label(c, detail, ui.font(8, false), muted, rect{X: r.X + 66, Y: r.Y + 33, Width: width, Height: 22}, oneLine)
+	x := r.X + 62
+	width := textRight - x - 12
+	label(c, title, ui.font(10, true), ink, rect{X: x, Y: r.Y + 7, Width: width, Height: 24}, oneLine)
+	label(c, detail, ui.font(8, false), muted, rect{X: x, Y: r.Y + 30, Width: width, Height: 22}, oneLine)
 }
+
+// bannerButtonY centraliza os botões de 32 px na faixa do aviso.
+func bannerButtonY(r rect) int { return r.Y + (r.Height-32)/2 }
 
 func (ui *nativeDesktopUI) paintPairingBanner(c *painter, r rect, p pairingView) {
 	ui.bannerFrame(c, r, warning, warningSoft, glyphShield)
-	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "pair-approve|"+p.RequestID, "Permitir", x, r.Y+16, buttonPrimary)
-	x = ui.smallButton(c, "pair-reject|"+p.RequestID, "Recusar", x, r.Y+16, buttonSubtle)
+	x := r.X + r.Width - 14
+	x = ui.smallButton(c, "pair-approve|"+p.RequestID, "Permitir", x, bannerButtonY(r), buttonPrimary)
+	x = ui.smallButton(c, "pair-reject|"+p.RequestID, "Recusar", x, bannerButtonY(r), buttonOnTint)
 	code := p.Code
 	if len(code) == 6 {
 		code = code[:3] + " " + code[3:]
@@ -554,7 +572,7 @@ func (ui *nativeDesktopUI) paintPairingBanner(c *painter, r rect, p pairingView)
 
 func (ui *nativeDesktopUI) paintNetworkBanner(c *painter, r rect) {
 	ui.bannerFrame(c, r, warning, warningSoft, glyphWarning)
-	x := r.X + r.Width - 16
+	x := r.X + r.Width - 14
 	title := "O Windows está bloqueando o celular"
 	detail := "O firewall não liberou o LocalDrop. Corrigir pede uma permissão ao Windows."
 	if ui.health.PublicNetwork {
@@ -563,17 +581,17 @@ func (ui *nativeDesktopUI) paintNetworkBanner(c *painter, r rect) {
 	if ui.fixing {
 		title, detail = "Aguardando a permissão do Windows…", "Confirme no aviso do Windows que apareceu na tela."
 	} else {
-		x = ui.smallButton(c, "net-fix", "Corrigir", x, r.Y+16, buttonPrimary)
-		x = ui.smallButton(c, "net-settings", "Configurações de rede", x, r.Y+16, buttonSubtle)
+		x = ui.smallButton(c, "net-fix", "Corrigir", x, bannerButtonY(r), buttonPrimary)
+		x = ui.smallButton(c, "net-settings", "Configurações de rede", x, bannerButtonY(r), buttonOnTint)
 	}
 	ui.bannerText(c, r, title, detail, x)
 }
 
 func (ui *nativeDesktopUI) paintPairedBanner(c *painter, r rect) {
 	ui.bannerFrame(c, r, success, successSoft, glyphCheck)
-	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "paired-ok", "OK", x, r.Y+16, buttonPrimary)
-	x = ui.smallButton(c, "paired-undo", "Desfazer", x, r.Y+16, buttonSubtle)
+	x := r.X + r.Width - 14
+	x = ui.smallButton(c, "paired-ok", "OK", x, bannerButtonY(r), buttonPrimary)
+	x = ui.smallButton(c, "paired-undo", "Desfazer", x, bannerButtonY(r), buttonOnTint)
 	ui.bannerText(c, r, ui.paired.name+" foi conectado",
 		"Já pode enviar e receber arquivos. Não foi você? Clique em Desfazer.", x)
 }
@@ -584,20 +602,20 @@ func (ui *nativeDesktopUI) paintOfferBanner(c *painter, r rect, t TransferView) 
 	if len(t.Files) == 1 {
 		files = t.Files[0].Name
 	}
-	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "t-accept|"+t.ID, "Aceitar", x, r.Y+16, buttonPrimary)
-	x = ui.smallButton(c, "t-reject|"+t.ID, "Recusar", x, r.Y+16, buttonSubtle)
+	x := r.X + r.Width - 14
+	x = ui.smallButton(c, "t-accept|"+t.ID, "Aceitar", x, bannerButtonY(r), buttonPrimary)
+	x = ui.smallButton(c, "t-reject|"+t.ID, "Recusar", x, bannerButtonY(r), buttonOnTint)
 	ui.bannerText(c, r, ui.peerName(t.SenderID)+" quer enviar "+files,
 		formatNativeBytes(t.TotalBytes)+" · vai para "+ui.downloadDirectory(), x)
 }
 
 func (ui *nativeDesktopUI) paintAutostartBanner(c *painter, r rect) {
-	ui.bannerFrame(c, r, primary, primarySoft, glyphPower)
-	x := r.X + r.Width - 16
-	x = ui.smallButton(c, "autostart-yes", "Sim, abrir", x, r.Y+16, buttonPrimary)
-	x = ui.smallButton(c, "autostart-no", "Agora não", x, r.Y+16, buttonSubtle)
+	ui.bannerFrame(c, r, ink, subtleBG, glyphPower)
+	x := r.X + r.Width - 14
+	x = ui.smallButton(c, "autostart-yes", "Sim, abrir", x, bannerButtonY(r), buttonOnTint)
+	x = ui.smallButton(c, "autostart-no", "Agora não", x, bannerButtonY(r), buttonOnTint)
 	ui.bannerText(c, r, "Abrir o LocalDrop junto com o Windows?",
-		"Assim ele fica pronto na bandeja para receber, sem você precisar lembrar.", x)
+		"Ele fica na bandeja, pronto para receber.", x)
 }
 
 // inviteURL é o endereço levado pelo QR: abre o LocalDrop no celular já com
@@ -668,55 +686,51 @@ func (ui *nativeDesktopUI) paintOnboarding(c *painter, r rect) {
 	label(c, "O celular precisa estar no mesmo Wi-Fi deste computador.", ui.font(8, false), muted, rect{X: x, Y: r.Y + 164, Width: buttonX - x - 8, Height: 32}, oneLine)
 }
 
+// paintDevices é a linha de cima do cartão de envio: "Enviar para" e uma
+// pílula por aparelho. Os que não cabem ficam para os Ajustes.
 func (ui *nativeDesktopUI) paintDevices(c *painter, r rect) {
-	label(c, "ENVIAR PARA", ui.font(8, true), muted, rect{X: r.X + 2, Y: r.Y, Width: 200, Height: 20}, oneLine)
-	chipY, chipH, gap := r.Y+26, 58, 12
-	available := r.Width - chipH - gap
-	n := len(ui.peers)
-	chipW := 230
-	if n > 0 && (available-(n-1)*gap)/n < chipW {
-		chipW = (available - (n-1)*gap) / n
-	}
-	if chipW < 170 {
-		chipW = 170
-	}
-	x := r.X
+	labelFont := ui.font(9, true)
+	title := "Enviar para"
+	titleW := ui.textWidth(c, title, labelFont)
+	label(c, title, labelFont, ink, rect{X: r.X + 20, Y: r.Y + 12, Width: titleW + 4, Height: 40}, oneLine)
+	chipH, gap := 40, 8
+	chipY := r.Y + 12
+	x := r.X + 20 + titleW + 16
+	limit := r.X + r.Width - 16 - chipH - gap
+	nameFont := ui.font(9, true)
 	for _, peer := range ui.peers {
-		if x+chipW > r.X+available {
+		chipW := 34 + ui.textWidth(c, peer.DisplayName, nameFont) + 34
+		if chipW > 260 {
+			chipW = 260
+		}
+		if x+chipW > limit {
 			break
 		}
 		chip := rect{X: x, Y: chipY, Width: chipW, Height: chipH}
 		id := "peer|" + peer.DeviceID
 		selected := peer.DeviceID == ui.selectedPeer
-		bg, border := panel, line
-		if selected {
-			bg, border = primarySoft, primary
-		} else if ui.hovered(id) {
-			border = rgb(200, 194, 245)
+		bg, border, fg := panel, line, ink
+		switch {
+		case selected:
+			bg, border, fg = primarySoft, primary, primaryDark
+		case !peer.Online:
+			fg = muted
+		case ui.hovered(id):
+			bg = subtleBG
 		}
-		rounded(c, bg, chip, 14)
-		outline(c, border, chip, 14)
-		if selected {
-			outline(c, border, inset(chip, 1, 1, 1, 1), 13)
-		}
-		circle := rect{X: chip.X + 10, Y: chip.Y + 11, Width: 36, Height: 36}
-		circleBG, glyphColor := subtleBG, ink
-		if selected {
-			circleBG, glyphColor = primary, white
-		}
-		dot(c, circleBG, circle)
+		rounded(c, bg, chip, chipH/2)
+		outline(c, border, chip, chipH/2)
 		g := glyphDesktop
 		if isMobileType(peer.DeviceType) {
 			g = glyphPhone
 		}
-		ui.glyph(c, g, 12, glyphColor, circle)
-		label(c, peer.DisplayName, ui.font(9, true), ink, rect{X: chip.X + 56, Y: chip.Y + 8, Width: chipW - 66, Height: 22}, oneLine)
-		state, stateColor := "Disponível", success
+		ui.glyph(c, g, 11, fg, rect{X: chip.X + 12, Y: chip.Y, Width: 18, Height: chipH})
+		label(c, peer.DisplayName, nameFont, fg, rect{X: chip.X + 36, Y: chip.Y, Width: chipW - 66, Height: chipH}, oneLine)
+		stateColor := success
 		if !peer.Online {
-			state, stateColor = "Fora do Wi-Fi", muted
+			stateColor = offlineDot
 		}
-		dot(c, stateColor, rect{X: chip.X + 57, Y: chip.Y + 37, Width: 7, Height: 7})
-		label(c, state, ui.font(8, false), stateColor, rect{X: chip.X + 70, Y: chip.Y + 29, Width: chipW - 80, Height: 22}, oneLine)
+		dot(c, stateColor, rect{X: chip.X + chipW - 22, Y: chip.Y + chipH/2 - 4, Width: 8, Height: 8})
 		ui.add(id, chip)
 		x += chipW + gap
 	}
@@ -725,39 +739,51 @@ func (ui *nativeDesktopUI) paintDevices(c *painter, r rect) {
 	if ui.hovered("connect-chip") {
 		bg = primarySoft
 	}
-	rounded(c, bg, add, 14)
-	dashedOutline(c, rgb(190, 184, 240), add, 14)
-	ui.glyph(c, glyphAdd, 12, primary, add)
+	rounded(c, bg, add, chipH/2)
+	dashedOutline(c, primaryLine, add, chipH/2)
+	ui.glyph(c, glyphAdd, 11, primary, add)
 	ui.add("connect-chip", add)
 }
 
+// paintDrop é a área de soltar. Com aparelhos, fica dentro do cartão de envio;
+// no primeiro uso, é um cartão próprio, desativado, explicando o que falta.
 func (ui *nativeDesktopUI) paintDrop(c *painter, r rect) {
 	enabled := ui.selectedPeer != ""
-	bg, border := panel, rgb(196, 190, 242)
-	if enabled && ui.hovered("drop") {
-		bg, border = rgb(247, 246, 255), primary
-	}
-	rounded(c, bg, r, 16)
-	dashedOutline(c, border, r, 16)
-	circle := rect{X: r.X + 24, Y: r.Y + (r.Height-52)/2, Width: 52, Height: 52}
-	if r.Height < 100 {
-		circle = rect{X: r.X + 20, Y: r.Y + (r.Height-44)/2, Width: 44, Height: 44}
-	}
-	dot(c, primarySoft, circle)
-	ui.glyph(c, glyphUpload, 16, primary, circle)
-	x := circle.X + circle.Width + 18
+	zone := inset(r, 16, 0, 16, 16)
 	if !enabled {
-		w := r.X + r.Width - x - 20
-		label(c, "Arraste arquivos para cá", ui.font(11, true), muted, rect{X: x, Y: r.Y + r.Height/2 - 26, Width: w, Height: 26}, oneLine)
-		label(c, "Primeiro conecte um celular. O envio fica disponível assim que ele aparecer aqui.", ui.font(9, false), muted, rect{X: x, Y: r.Y + r.Height/2, Width: w, Height: 24}, oneLine)
+		zone = r
+	}
+	bg, border := rgb(250, 250, 255), primaryLine
+	if !enabled {
+		bg, border = panel, line
+	} else if ui.hovered("drop") {
+		bg, border = primarySoft, primary
+	}
+	rounded(c, bg, zone, 12)
+	dashedOutline(c, border, zone, 12)
+	size := 44
+	circle := rect{X: zone.X + 20, Y: zone.Y + (zone.Height-size)/2, Width: size, Height: size}
+	circleBG, glyphColor := primarySoft, primary
+	if enabled {
+		circleBG, glyphColor = primary, white
+	} else {
+		circleBG, glyphColor = subtleBG, muted
+	}
+	dot(c, circleBG, circle)
+	ui.glyph(c, glyphUpload, 14, glyphColor, circle)
+	x := circle.X + circle.Width + 16
+	if !enabled {
+		w := zone.X + zone.Width - x - 20
+		label(c, "Arraste arquivos para cá", ui.font(10, true), muted, rect{X: x, Y: zone.Y + zone.Height/2 - 25, Width: w, Height: 24}, oneLine)
+		label(c, "Fica disponível assim que um celular se conectar.", ui.font(9, false), muted, rect{X: x, Y: zone.Y + zone.Height/2 - 1, Width: w, Height: 24}, oneLine)
 		return
 	}
-	ui.add("drop", r)
-	textButton := r.X + r.Width - 20
-	textButton = ui.smallButton(c, "send-text", "Enviar texto", textButton, r.Y+(r.Height-32)/2, buttonSubtle)
+	ui.add("drop", zone)
+	textButton := zone.X + zone.Width - 16
+	textButton = ui.smallButton(c, "send-text", "Enviar texto", textButton, zone.Y+(zone.Height-32)/2, buttonOnTint)
 	w := textButton - x - 8
-	label(c, "Arraste arquivos para cá ou clique para escolher", ui.font(11, true), ink, rect{X: x, Y: r.Y + r.Height/2 - 27, Width: w, Height: 26}, oneLine)
-	label(c, "Vão para "+ui.peerName(ui.selectedPeer)+", sem cópias extras", ui.font(9, false), muted, rect{X: x, Y: r.Y + r.Height/2 + 1, Width: w, Height: 24}, oneLine)
+	label(c, "Arraste arquivos para cá ou clique para escolher", ui.font(10, true), ink, rect{X: x, Y: zone.Y + zone.Height/2 - 25, Width: w, Height: 24}, oneLine)
+	label(c, "Vão direto para "+ui.peerName(ui.selectedPeer)+", sem cópias extras.", ui.font(9, false), muted, rect{X: x, Y: zone.Y + zone.Height/2 - 1, Width: w, Height: 24}, oneLine)
 }
 
 func (ui *nativeDesktopUI) hasFinished() bool {
@@ -775,19 +801,19 @@ func (ui *nativeDesktopUI) paintActivity(c *painter, r rect) {
 		return
 	}
 	ui.card(c, r)
-	label(c, "ATIVIDADE", ui.font(8, true), primary, rect{X: r.X + 20, Y: r.Y + 12, Width: 200, Height: 24}, oneLine)
+	label(c, "Atividade", ui.font(10, true), ink, rect{X: r.X + 20, Y: r.Y + 12, Width: 200, Height: 28}, oneLine)
 	transfers := ui.snapshot.Transfers
 	if len(transfers) == 0 {
-		label(c, "Nada por aqui ainda", ui.font(11, true), ink, rect{X: r.X + 20, Y: r.Y + 46, Width: r.Width - 40, Height: 26}, oneLine)
-		label(c, "Arquivos enviados e recebidos aparecem nesta lista, com o andamento e atalhos para abrir.", ui.font(9, false), muted, rect{X: r.X + 20, Y: r.Y + 74, Width: r.Width - 40, Height: 24}, oneLine)
+		label(c, "Nada enviado ou recebido ainda", ui.font(9, true), ink, rect{X: r.X + 20, Y: r.Y + 50, Width: r.Width - 40, Height: 24}, oneLine)
+		label(c, "Cada envio aparece aqui, com o andamento e atalhos para abrir.", ui.font(9, false), muted, rect{X: r.X + 20, Y: r.Y + 74, Width: r.Width - 40, Height: 24}, oneLine)
 		return
 	}
 	headerRight := r.X + r.Width - 16
 	if ui.hasFinished() {
 		headerRight = ui.smallButton(c, "clear-list", "Limpar lista", headerRight, r.Y+8, buttonSubtle)
 	}
-	rowH := 60
-	listTop := r.Y + 46
+	rowH := 58
+	listTop := r.Y + 48
 	visible := (r.Y + r.Height - 8 - listTop) / rowH
 	if visible < 1 {
 		visible = 1
@@ -814,7 +840,7 @@ func (ui *nativeDesktopUI) paintActivity(c *painter, r rect) {
 		if span := len(transfers) - visible; span > 0 {
 			thumbY += (track.Height - thumbH) * ui.activityOffset / span
 		}
-		rounded(c, rgb(180, 174, 236), rect{X: track.X, Y: thumbY, Width: track.Width, Height: thumbH}, 6)
+		rounded(c, primaryLine, rect{X: track.X, Y: thumbY, Width: track.Width, Height: thumbH}, 6)
 		ui.add("scroll-up", rect{X: track.X - 4, Y: track.Y, Width: track.Width + 8, Height: thumbY - track.Y})
 		ui.add("scroll-down", rect{X: track.X - 4, Y: thumbY + thumbH, Width: track.Width + 8, Height: track.Y + track.Height - thumbY - thumbH})
 		rowRight = track.X - 6
@@ -852,9 +878,9 @@ func (ui *nativeDesktopUI) paintTransferRow(c *painter, r rect, t TransferView) 
 	case incoming && t.State == "COMPLETED" && len(t.Files) > 0 && t.Files[0].SavedPath != nil:
 		right = ui.smallButton(c, "t-folder|"+t.ID, "Mostrar na pasta", right, y, buttonSubtle)
 		if len(t.Files) == 1 && isTextMessage(t.Files[0]) {
-			right = ui.smallButton(c, "t-copy|"+t.ID, "Copiar texto", right, y, buttonPrimary)
+			right = ui.smallButton(c, "t-copy|"+t.ID, "Copiar texto", right, y, buttonSubtle)
 		} else if len(t.Files) == 1 {
-			right = ui.smallButton(c, "t-open|"+t.ID, "Abrir", right, y, buttonPrimary)
+			right = ui.smallButton(c, "t-open|"+t.ID, "Abrir", right, y, buttonSubtle)
 		}
 	case !isTerminalState(t.State):
 		right = ui.smallButton(c, "t-cancel|"+t.ID, "Cancelar", right, y, buttonDanger)
@@ -937,7 +963,7 @@ func (ui *nativeDesktopUI) paintSettings(c *painter, l canvasLayout) {
 
 	identity := rect{X: x, Y: y, Width: colW, Height: 256}
 	ui.card(c, identity)
-	label(c, "ESTE COMPUTADOR", ui.font(8, true), primary, rect{X: identity.X + 20, Y: identity.Y + 12, Width: 240, Height: 22}, oneLine)
+	label(c, "Este computador", ui.font(10, true), ink, rect{X: identity.X + 20, Y: identity.Y + 12, Width: 240, Height: 22}, oneLine)
 	rowW := identity.Width - 40
 	row := func(index int) int { return identity.Y + 40 + index*54 }
 	divider := func(index int) {
@@ -964,7 +990,7 @@ func (ui *nativeDesktopUI) paintSettings(c *painter, l canvasLayout) {
 
 	phone := rect{X: x, Y: identity.Y + identity.Height + gap, Width: colW, Height: 112}
 	ui.card(c, phone)
-	label(c, "ACESSO PELO CELULAR", ui.font(8, true), primary, rect{X: phone.X + 20, Y: phone.Y + 12, Width: 240, Height: 22}, oneLine)
+	label(c, "Acesso pelo celular", ui.font(10, true), ink, rect{X: phone.X + 20, Y: phone.Y + 12, Width: 240, Height: 22}, oneLine)
 	label(c, ui.addressURL(), ui.font(11, true), ink, rect{X: phone.X + 20, Y: phone.Y + 34, Width: phone.Width - 40, Height: 26}, oneLine)
 	ui.button(c, "connect", "Mostrar QR", glyphQR, rect{X: phone.X + 20, Y: phone.Y + 68, Width: 140, Height: 32}, buttonPrimary, true)
 	ui.button(c, "copy-url", "Copiar endereço", "", rect{X: phone.X + 170, Y: phone.Y + 68, Width: 156, Height: 32}, buttonSubtle, true)
@@ -972,7 +998,7 @@ func (ui *nativeDesktopUI) paintSettings(c *painter, l canvasLayout) {
 	trustedHeight := l.bottom - y - 96
 	trusted := rect{X: x + colW + gap, Y: y, Width: w - colW - gap, Height: trustedHeight}
 	ui.card(c, trusted)
-	label(c, "MEUS APARELHOS", ui.font(8, true), primary, rect{X: trusted.X + 20, Y: trusted.Y + 12, Width: 240, Height: 22}, oneLine)
+	label(c, "Meus aparelhos", ui.font(10, true), ink, rect{X: trusted.X + 20, Y: trusted.Y + 12, Width: 240, Height: 22}, oneLine)
 	if len(ui.peers) == 0 {
 		label(c, "Nenhum aparelho conectado ainda.", ui.font(10, true), ink, rect{X: trusted.X + 20, Y: trusted.Y + 44, Width: trusted.Width - 40, Height: 24}, oneLine)
 		label(c, "Use Conectar celular para adicionar o primeiro.", ui.font(9, false), muted, rect{X: trusted.X + 20, Y: trusted.Y + 70, Width: trusted.Width - 40, Height: 24}, oneLine)
@@ -1017,7 +1043,7 @@ func (ui *nativeDesktopUI) paintSettings(c *painter, l canvasLayout) {
 }
 
 func (ui *nativeDesktopUI) paintModal(c *painter, b rect) {
-	fill(c, rgb(214, 217, 232), b)
+	fill(c, rgb(222, 224, 233), b)
 	p := strings.SplitN(ui.modal, "|", 2)
 	kind, msg := p[0], ""
 	if len(p) > 1 {
@@ -2267,4 +2293,3 @@ func showDesktopPanel(server *Server, startHidden bool) bool {
 	ui.dispose()
 	return true
 }
-

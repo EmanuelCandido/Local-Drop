@@ -190,7 +190,6 @@ describe('NetworkPanel', () => {
           ],
         }}
         host
-        connection="online"
         onToast={vi.fn()}
       />,
     );

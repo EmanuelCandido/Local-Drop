@@ -8,13 +8,13 @@ func TestWindowFrameUsesLocalDropPalette(t *testing.T) {
 	t.Parallel()
 
 	style := localDropWindowFrameStyle()
-	if style.caption != uint32(sidebar) {
+	if style.caption != uint32(panel) {
 		t.Fatalf("barra de título fora da paleta: %#x", style.caption)
 	}
-	if style.border != uint32(primary) {
+	if style.border != uint32(line) {
 		t.Fatalf("borda fora da paleta: %#x", style.border)
 	}
-	if style.text != uint32(rgb(255, 255, 255)) {
-		t.Fatalf("texto da barra deve permanecer claro: %#x", style.text)
+	if style.text != uint32(ink) {
+		t.Fatalf("texto da barra deve ser escuro sobre a barra clara: %#x", style.text)
 	}
 }

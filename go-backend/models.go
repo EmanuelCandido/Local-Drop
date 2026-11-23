@@ -11,6 +11,9 @@ type DeviceRecord struct {
 	Revoked     bool      `json:"revoked"`
 	CreatedAt   time.Time `json:"createdAt"`
 	LastSeenAt  time.Time `json:"lastSeenAt"`
+	// HardwareKey reconhece o mesmo aparelho físico quando ele volta com outro
+	// identificador (ver hardware.go).
+	HardwareKey string `json:"hardwareKey,omitempty"`
 }
 
 type DeviceView struct {

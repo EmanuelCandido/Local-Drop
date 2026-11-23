@@ -240,6 +240,15 @@ func (s *Server) handlePairingPoll(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("requestId")
 	pollToken := r.Header.Get("X-Pairing-Poll-Token")
 	now := time.Now().UTC()
+	// A consulta à rede só é necessária quando o pedido acabou de ser aprovado.
+	s.mu.RLock()
+	approved := s.state.Pairings[id] != nil && s.state.Pairings[id].Status == "APPROVED"
+	s.mu.RUnlock()
+	hardwareKey := ""
+	if approved {
+		hardwareKey = resolveHardwareKey(r)
+	}
+	var removed []string
 	s.mu.Lock()
 	pairing := s.state.Pairings[id]
 	if pairing == nil {
@@ -269,11 +278,13 @@ func (s *Server) handlePairingPoll(w http.ResponseWriter, r *http.Request) {
 				device = &DeviceRecord{DeviceID: pairing.DeviceID, CreatedAt: now}
 				s.state.Devices[pairing.DeviceID] = device
 			}
-			device.DisplayName = s.uniqueDeviceNameLocked(pairing.DisplayName, pairing.DeviceID)
-			device.DeviceType = pairing.DeviceType
-			device.TokenHash = pairing.TokenHash
 			device.Host = false
 			device.Revoked = false
+			var inherited string
+			removed, inherited = s.adoptHardwareLocked(device, hardwareKey)
+			device.DisplayName = s.pairedNameLocked(pairing.DisplayName, inherited, pairing.DeviceID)
+			device.DeviceType = pairing.DeviceType
+			device.TokenHash = pairing.TokenHash
 			device.LastSeenAt = now
 			pairing.IssuedToken = ""
 			pairing.Code = ""
@@ -283,6 +294,7 @@ func (s *Server) handlePairingPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	status := pairing.Status
 	s.mu.Unlock()
+	s.announceAbsorbed(removed)
 	writeJSON(w, map[string]any{"requestId": id, "status": status, "deviceToken": token})
 }
 
@@ -421,15 +433,27 @@ func (s *Server) rejectPairing(id string) error {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	principal := principalOf(r)
-	s.mu.RLock()
+	// Chamado a cada abertura da página: aproveita para registrar (ou atualizar)
+	// a chave de hardware de aparelhos conectados antes dela existir.
+	hardwareKey := ""
+	if !principal.Host {
+		hardwareKey = resolveHardwareKey(r)
+	}
+	s.mu.Lock()
 	device := s.state.Devices[principal.DeviceID]
 	if device == nil || device.Revoked {
-		s.mu.RUnlock()
+		s.mu.Unlock()
 		writeProblem(w, r, problem(404, "DEVICE_NOT_FOUND", "Este aparelho não está mais conectado ao computador."))
 		return
 	}
+	var removed []string
+	if hardwareKey != "" && device.HardwareKey != hardwareKey {
+		removed, _ = s.adoptHardwareLocked(device, hardwareKey)
+		_ = s.saveLocked()
+	}
 	view := s.deviceViewLocked(device)
-	s.mu.RUnlock()
+	s.mu.Unlock()
+	s.announceAbsorbed(removed)
 	writeJSON(w, view)
 }
 
@@ -613,6 +637,7 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, err)
 		return
 	}
+	hardwareKey := resolveHardwareKey(r)
 	now := time.Now().UTC()
 	s.mu.Lock()
 	device := s.state.Devices[request.DeviceID]
@@ -620,11 +645,12 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 		device = &DeviceRecord{DeviceID: request.DeviceID, CreatedAt: now}
 		s.state.Devices[request.DeviceID] = device
 	}
-	device.DisplayName = s.uniqueDeviceNameLocked(request.DisplayName, request.DeviceID)
-	device.DeviceType = request.DeviceType
-	device.TokenHash = tokenHash
 	device.Host = false
 	device.Revoked = false
+	removed, inherited := s.adoptHardwareLocked(device, hardwareKey)
+	device.DisplayName = s.pairedNameLocked(request.DisplayName, inherited, request.DeviceID)
+	device.DeviceType = request.DeviceType
+	device.TokenHash = tokenHash
 	device.LastSeenAt = now
 	name := device.DisplayName
 	saveErr := s.saveLocked()
@@ -633,6 +659,7 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, saveErr)
 		return
 	}
+	s.announceAbsorbed(removed)
 	s.hub.SendToHost("DEVICE_PAIRED", map[string]any{"deviceId": request.DeviceID, "displayName": name})
 	writeJSONStatus(w, http.StatusCreated, map[string]string{"deviceId": request.DeviceID, "deviceToken": token, "displayName": name})
 }

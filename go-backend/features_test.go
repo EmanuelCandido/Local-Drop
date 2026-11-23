@@ -261,3 +261,63 @@ func TestEmbeddedWebServesGzipWhenAvailable(t *testing.T) {
 		t.Fatalf("revalidação deveria responder 304: %d", cached.StatusCode)
 	}
 }
+
+func TestSamePhoneReconnectingReplacesOldEntry(t *testing.T) {
+	original := resolveHardwareKey
+	defer func() { resolveHardwareKey = original }()
+	current := "celular-a"
+	resolveHardwareKey = func(*http.Request) string { return current }
+
+	server, err := NewServer(testConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	client := httpServer.Client()
+	host := claimTestHost(t, httpServer.URL, client)
+
+	type paired struct {
+		DeviceID    string `json:"deviceId"`
+		DisplayName string `json:"displayName"`
+	}
+	connect := func(deviceID, name string) paired {
+		invite, _, _ := server.currentInvite()
+		return decodeResponse[paired](t, redeemInvite(t, client, httpServer.URL, invite, deviceID, name), http.StatusCreated)
+	}
+	const oldID, newID, otherID = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"
+	if first := connect(oldID, "Manel"); first.DisplayName != "Manel" {
+		t.Fatalf("primeira conexão: %#v", first)
+	}
+	path := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(path, []byte("oi"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := server.offerLocalFiles(host.DeviceID, oldID, []string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// O mesmo celular volta com outro identificador e o nome automático.
+	again := connect(newID, "Meu celular")
+	if again.DisplayName != "Manel" {
+		t.Fatalf("o nome escolhido antes devia ser mantido: %q", again.DisplayName)
+	}
+	// Outro aparelho físico continua sendo outro aparelho.
+	current = "celular-b"
+	if other := connect(otherID, "Meu celular"); other.DisplayName != "Meu celular" {
+		t.Fatalf("outro aparelho: %#v", other)
+	}
+
+	server.mu.RLock()
+	defer server.mu.RUnlock()
+	if server.state.Devices[oldID] != nil {
+		t.Fatal("o registro antigo do mesmo celular devia ter saído da lista")
+	}
+	if len(server.trustedDeviceViewsLocked()) != 3 {
+		t.Fatalf("esperava host + 2 aparelhos, veio %d", len(server.trustedDeviceViewsLocked()))
+	}
+	if got := server.state.Transfers[offer.ID].ReceiverID; got != newID {
+		t.Fatalf("o histórico devia passar para o registro novo, ficou em %q", got)
+	}
+}

@@ -19,7 +19,7 @@ export function IncomingOffer({ transfer, sender, busy, onAccept, onReject }: Pr
         <span className="offer-icon" aria-hidden="true"><Icon name="arrow-down" size={20} /></span>
         <div>
           <h2 id={`offer-${transfer.id}`}>{sender?.displayName ?? 'Um dispositivo'} quer enviar {single ? 'um arquivo' : `${transfer.files.length} arquivos`}</h2>
-          <p>{formatBytes(transfer.totalBytes)} · nada é salvo sem sua permissão</p>
+          <p>{formatBytes(transfer.totalBytes)}</p>
         </div>
       </div>
       <ul className="offer-files">

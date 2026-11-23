@@ -533,7 +533,7 @@ export function App() {
           onForgetSession={forgetSession}
           onClose={() => setSettingsOpen(false)}
         >
-          {session.host && <NetworkPanel network={network} host connection={connection} onToast={showToast} />}
+          {session.host && <NetworkPanel network={network} host onToast={showToast} />}
         </SettingsPanel>
       )}
 

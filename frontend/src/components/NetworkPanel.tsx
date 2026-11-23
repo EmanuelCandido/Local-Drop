@@ -6,11 +6,10 @@ import { Icon } from './Icon';
 type Props = {
   network: NetworkInfo | null;
   host: boolean;
-  connection: string;
   onToast: (message: string) => void;
 };
 
-export function NetworkPanel({ network, host, connection, onToast }: Props) {
+export function NetworkPanel({ network, host, onToast }: Props) {
   const [selectedIpv4, setSelectedIpv4] = useState('');
   if (!network) {
     return (
@@ -60,12 +59,8 @@ export function NetworkPanel({ network, host, connection, onToast }: Props) {
       <div className="network-panel-heading">
         <span className="network-icon"><Icon name="wifi" size={20} /></span>
         <div>
-          <p className="eyebrow">CONECTAR DISPOSITIVO</p>
           <h2 id="network-title">Abra no celular</h2>
         </div>
-        <span className={`network-state ${connection === 'online' ? 'is-online' : ''}`}>
-          <span className="status-dot" /> {connection === 'online' ? 'Disponível' : 'Reconectando'}
-        </span>
       </div>
 
       {host ? (
@@ -75,7 +70,6 @@ export function NetworkPanel({ network, host, connection, onToast }: Props) {
               src={apiUrl(`/api/v1/network/qr${qrQuery}`)}
               alt={`QR Code para abrir ${selectedUrl} no navegador`}
             />
-            <span aria-hidden="true"><Icon name="send" size={14} /></span>
           </div>
           <div className="qr-copy">
             <strong>Escaneie com a câmera</strong>
@@ -91,7 +85,7 @@ export function NetworkPanel({ network, host, connection, onToast }: Props) {
 
       <div className="network-address-card">
         <div>
-          <span>ENDEREÇO DA REDE</span>
+          <span>Endereço da rede</span>
           <strong>{selectedUrl}</strong>
         </div>
         <button type="button" className="icon-button button-secondary" onClick={() => void copy()} aria-label="Copiar endereço">

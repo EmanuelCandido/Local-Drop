@@ -16,9 +16,9 @@ type nativeWindowFrameStyle struct {
 
 func localDropWindowFrameStyle() nativeWindowFrameStyle {
 	return nativeWindowFrameStyle{
-		caption: uint32(sidebar),
-		border:  uint32(primary),
-		text:    uint32(rgb(255, 255, 255)),
+		caption: uint32(panel),
+		border:  uint32(line),
+		text:    uint32(ink),
 	}
 }
 
@@ -29,7 +29,7 @@ func applyLocalDropWindowFrame(hwnd uintptr) {
 		return
 	}
 	handle := windows.HWND(hwnd)
-	darkMode := uint32(1)
+	darkMode := uint32(0) // barra clara, igual ao cabeçalho
 	if err := setDWMWindowAttribute(handle, windows.DWMWA_USE_IMMERSIVE_DARK_MODE, darkMode); err != nil {
 		// Versões do Windows 10 anteriores ao build 18985 usavam o atributo 19.
 		_ = setDWMWindowAttribute(handle, 19, darkMode)
